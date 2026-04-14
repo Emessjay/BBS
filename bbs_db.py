@@ -179,26 +179,28 @@ def cmd_read(board: str | None = None) -> None:
                 print(f"\n  {DIM}No posts on {RESET}{PURPLE}{board}{RESET}{DIM} yet.{RESET}\n")
                 return
             rows = conn.execute(f"""
-                SELECT u.username, t.message, t.timestamp, '{board}' AS board
+                SELECT u.username, t.message, t.timestamp, ? AS board
                   FROM {table} t
                   JOIN users u ON t.user_id = u.id
                  ORDER BY t.id ASC
-            """).fetchall()
+            """, (board,)).fetchall()
         else:
             boards = get_board_names(conn)
             if not boards:
                 print(f"\n  {DIM}No posts yet. Be the first to transmit.{RESET}\n")
                 return
             parts = []
+            params = []
             for b in boards:
                 t = board_table(b)
                 parts.append(f"""
-                    SELECT u.username, t.message, t.timestamp, '{b}' AS board
+                    SELECT u.username, t.message, t.timestamp, ? AS board
                       FROM {t} t
                       JOIN users u ON t.user_id = u.id
                 """)
+                params.append(b)
             query = " UNION ALL ".join(parts) + " ORDER BY timestamp ASC"
-            rows = conn.execute(query).fetchall()
+            rows = conn.execute(query, params).fetchall()
 
     if not rows:
         if board:
@@ -296,17 +298,17 @@ def cmd_search(keyword: str) -> None:
             return
 
         parts = []
+        params = []
         for b in boards:
             t = board_table(b)
             parts.append(f"""
-                SELECT u.username, t.message, t.timestamp, '{b}' AS board
+                SELECT u.username, t.message, t.timestamp, ? AS board
                   FROM {t} t
                   JOIN users u ON t.user_id = u.id
                  WHERE t.message LIKE ?
             """)
+            params.extend([b, f"%{keyword}%"])
         query = " UNION ALL ".join(parts) + " ORDER BY timestamp ASC"
-        # Each sub-query needs its own copy of the LIKE parameter.
-        params = tuple(f"%{keyword}%" for _ in boards)
         rows = conn.execute(query, params).fetchall()
 
     if not rows:

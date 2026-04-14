@@ -31,6 +31,7 @@ rows from other boards — no filtering required, just a direct table scan.
 import re
 import sqlite3
 import os
+import hmac
 import hashlib
 from contextlib import contextmanager
 
@@ -60,7 +61,7 @@ def verify_password(password: str, stored: str) -> bool:
     salt_hex, key_hex = stored.split(":")
     salt = bytes.fromhex(salt_hex)
     key = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 100_000)
-    return key.hex() == key_hex
+    return hmac.compare_digest(key.hex(), key_hex)
 
 
 def board_table(name: str) -> str:
@@ -93,7 +94,7 @@ def get_board_names(conn) -> list[str]:
     """Return all board names by inspecting sqlite_master."""
     rows = conn.execute("""
         SELECT name FROM sqlite_master
-        WHERE type = 'table' AND name LIKE 'board_%'
+        WHERE type = 'table' AND name LIKE 'board\\_%' ESCAPE '\\'
         ORDER BY name
     """).fetchall()
     return [row[0][6:] for row in rows]   # strip "board_" prefix
