@@ -23,13 +23,12 @@ Usage:
     python migrate.py
 """
 
-import sys
 import os
 import json
 import shutil
 from datetime import datetime
 
-from db import DB_FILE, get_db, init_db
+from db import DB_FILE, get_db, init_db, board_table, create_board, get_board_names
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  Terminal colors  (same palette as bbs.py / bbs_db.py)
@@ -61,8 +60,8 @@ def load_db_posts() -> list[dict]:
     """
     Read every post out of the existing bbs.db as plain dicts.
 
-    JOINs in the username so the returned dicts match bbs.json's format:
-        {"username": ..., "message": ..., "timestamp": ...}
+    Iterates over all board_* tables and JOINs in the username so the
+    returned dicts match bbs.json's format (plus a "board" key).
 
     Returns [] if the DB doesn't exist or the tables are missing/empty.
     """
@@ -70,19 +69,26 @@ def load_db_posts() -> list[dict]:
         return []
     try:
         with get_db() as conn:
-            rows = conn.execute("""
-                SELECT u.username, p.message, p.timestamp
-                  FROM posts p
-                  JOIN users u ON p.user_id = u.id
-            """).fetchall()
+            boards = get_board_names(conn)
+            if not boards:
+                return []
+            results = []
+            for b in boards:
+                t = board_table(b)
+                rows = conn.execute(f"""
+                    SELECT u.username, t.message, t.timestamp
+                      FROM {t} t
+                      JOIN users u ON t.user_id = u.id
+                """).fetchall()
+                for r in rows:
+                    results.append({
+                        "username": r[0], "message": r[1],
+                        "timestamp": r[2], "board": b,
+                    })
     except Exception:
-        # DB exists but tables might not (e.g. brand-new file).
         return []
 
-    return [
-        {"username": r[0], "message": r[1], "timestamp": r[2]}
-        for r in rows
-    ]
+    return results
 
 
 def backup_db() -> str:
@@ -95,14 +101,13 @@ def backup_db() -> str:
 
 def wipe_db() -> None:
     """
-    Drop both tables and recreate them from scratch.
+    Drop all board tables and the users table, then recreate from scratch.
 
-    Dropping resets the AUTOINCREMENT counters so the first INSERT gets id=1,
-    which is the whole point — IDs will match chronological insertion order.
-    Posts are dropped first because they hold a foreign key into users.
+    Board tables are dropped first because they hold foreign keys into users.
     """
     with get_db() as conn:
-        conn.execute("DROP TABLE IF EXISTS posts")
+        for b in get_board_names(conn):
+            conn.execute(f"DROP TABLE IF EXISTS {board_table(b)}")
         conn.execute("DROP TABLE IF EXISTS users")
     init_db()
 
@@ -145,6 +150,7 @@ def main() -> None:
     with get_db() as conn:
         for post in all_posts:
             username = post["username"]
+            board    = post.get("board", "general")
 
             if username not in user_dict:
                 cursor = conn.execute(
@@ -153,8 +159,10 @@ def main() -> None:
                 )
                 user_dict[username] = cursor.lastrowid
 
+            create_board(conn, board)
+            t = board_table(board)
             conn.execute(
-                "INSERT INTO posts (user_id, message, timestamp) VALUES (?, ?, ?)",
+                f"INSERT INTO {t} (user_id, message, timestamp) VALUES (?, ?, ?)",
                 (user_dict[username], post["message"], post["timestamp"]),
             )
 

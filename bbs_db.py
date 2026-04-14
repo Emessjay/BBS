@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """
-bbs_db.py  —  Part B: SQLite-backed Bulletin Board System
+bbs_db.py  —  Part B: SQLite-backed Bulletin Board System (Silver: boards)
 
 Commands:
-    python bbs_db.py post <username> <message>   post a new message
-    python bbs_db.py read                         read all posts chronologically
-    python bbs_db.py users                        list users who have posted
-    python bbs_db.py search <keyword>             search messages (case-insensitive)
+    python bbs_db.py post <username> <message>               post to "general"
+    python bbs_db.py post <username> <board> <message>       post to a board
+    python bbs_db.py read                                     read all posts
+    python bbs_db.py read <board>                             read one board
+    python bbs_db.py boards                                   list all boards
+    python bbs_db.py users                                    list all users
+    python bbs_db.py search <keyword>                         search posts
 
 Data is stored in bbs.db (SQLite).  Schema is managed by db.py.
-No third-party dependencies — uses only Python stdlib (sqlite3).
 
 SQL INJECTION NOTE
 ──────────────────
@@ -23,7 +25,7 @@ import sys
 import os
 from datetime import datetime
 
-from db import get_db, init_db
+from db import get_db, init_db, board_table, create_board, get_board_names
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  Terminal color constants  (ANSI 256-color escape codes)
@@ -61,17 +63,21 @@ BANNER = (
 #  Display helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
-def format_post(username: str, message: str, timestamp: str) -> str:
+def format_post(username: str, message: str, timestamp: str, board: str | None = None) -> str:
     """
     Render a single post as a colored terminal line.
 
-    Takes three plain strings rather than a dict, matching how sqlite3
-    returns rows (by position).  Output format mirrors bbs.py exactly so
-    that migrated data looks identical in both versions.
+    Takes plain strings rather than a dict, matching how sqlite3
+    returns rows (by position).  When board is provided and is not
+    "general", it is shown as a tag before the username.
     """
     ts = timestamp[:16].replace("T", " ")   # "2026-03-24T14:01:32" → "2026-03-24 14:01"
+    board_tag = ""
+    if board and board != "general":
+        board_tag = f"{DIM}[{RESET}{PURPLE}{board}{RESET}{DIM}]{RESET} "
     return (
         f"  {DIM}[{RESET}{PURPLE}{ts}{RESET}{DIM}]{RESET} "
+        f"{board_tag}"
         f"{LIME}{username}{RESET}"
         f"{DIM}:{RESET} "
         f"{WHITE}{message}{RESET}"
@@ -83,10 +89,12 @@ def print_help() -> None:
     print(BANNER)
     print(
         f"  {PURPLE}Commands:{RESET}\n"
-        f"    {LIME}post{RESET}   {WHITE}<username> <message>{RESET}   post a new message\n"
-        f"    {LIME}read{RESET}                           read all posts\n"
-        f"    {LIME}users{RESET}                          list all users\n"
-        f"    {LIME}search{RESET} {WHITE}<keyword>{RESET}              search posts (case-insensitive)\n"
+        f"    {LIME}post{RESET}   {WHITE}<user> <message>{RESET}         post to general board\n"
+        f"    {LIME}post{RESET}   {WHITE}<user> <board> <message>{RESET} post to a specific board\n"
+        f"    {LIME}read{RESET}   {WHITE}[board]{RESET}                  read posts (all or one board)\n"
+        f"    {LIME}boards{RESET}                          list all boards\n"
+        f"    {LIME}users{RESET}                           list all users\n"
+        f"    {LIME}search{RESET} {WHITE}<keyword>{RESET}               search posts (case-insensitive)\n"
     )
 
 
@@ -94,93 +102,101 @@ def print_help() -> None:
 #  Commands
 # ──────────────────────────────────────────────────────────────────────────────
 
-def cmd_post(username: str, message: str) -> None:
+def cmd_post(username: str, board: str, message: str) -> None:
     """
-    Add a post to the database, creating the user row first if needed.
+    Add a post to the board's table, creating user and board as needed.
 
-    Two-step write, both inside the same transaction:
-      1. INSERT OR IGNORE into users — no-op if the username already exists,
-         which means repeat posters don't cause an error.
-      2. Look up the user's integer id, then INSERT the post with that id as
-         the foreign key.
-
-    WHY NOT JUST STORE THE USERNAME ON THE POST?
-    Normalisation: usernames live in one place (users.username).  Changing a
-    username later means updating one row, not scanning every post they wrote.
-    The JOIN in read/search is cheap; the structural benefit is permanent.
-
-    INJECTION SAFETY: all three queries use ? placeholders.
-    User-supplied strings (username, message) are never interpolated into SQL.
+    INJECTION SAFETY: user values use ? placeholders.  The board table name
+    is validated by board_table() (alphanumeric + underscores only) before
+    being interpolated, since table names can't be parameterised.
     """
+    table = board_table(board)
     with get_db() as conn:
-        # Create the user if this is their first post.
+        create_board(conn, board)
+
         conn.execute(
             "INSERT OR IGNORE INTO users (username) VALUES (?)",
             (username,),
         )
-
-        # Retrieve the user's id (works whether the row was just created or
-        # already existed — INSERT OR IGNORE guarantees the row is present).
         row = conn.execute(
             "SELECT id FROM users WHERE username = ?",
             (username,),
         ).fetchone()
         user_id = row[0]
 
-        # Insert the post with the resolved foreign key.
         conn.execute(
-            "INSERT INTO posts (user_id, message, timestamp) VALUES (?, ?, ?)",
+            f"INSERT INTO {table} (user_id, message, timestamp) VALUES (?, ?, ?)",
             (user_id, message, datetime.now().isoformat(timespec="seconds")),
         )
 
-    print(f"  {LIME}Posted.{RESET}")
+    print(f"  {LIME}Posted to {PURPLE}{board}{RESET}{LIME}.{RESET}")
 
 
-def cmd_read() -> None:
+def cmd_read(board: str | None = None) -> None:
     """
-    Print every post in chronological order (oldest first).
+    Print posts in chronological order.
 
-    The JOIN replaces the username lookup that Part A handles by storing the
-    username directly on the post object.  ORDER BY p.id is equivalent to
-    ordering by insertion time because AUTOINCREMENT ids are monotonically
-    increasing.
+    If board is given, read directly from that board's table.
+    Otherwise UNION ALL across every board table and sort by timestamp.
     """
     with get_db() as conn:
-        rows = conn.execute("""
-            SELECT u.username, p.message, p.timestamp
-              FROM posts p
-              JOIN users u ON p.user_id = u.id
-             ORDER BY p.id ASC
-        """).fetchall()
+        if board:
+            table = board_table(board)
+            # Check the board table exists before querying it.
+            exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (table,),
+            ).fetchone()
+            if not exists:
+                print(f"\n  {DIM}No posts on {RESET}{PURPLE}{board}{RESET}{DIM} yet.{RESET}\n")
+                return
+            rows = conn.execute(f"""
+                SELECT u.username, t.message, t.timestamp, '{board}' AS board
+                  FROM {table} t
+                  JOIN users u ON t.user_id = u.id
+                 ORDER BY t.id ASC
+            """).fetchall()
+        else:
+            boards = get_board_names(conn)
+            if not boards:
+                print(f"\n  {DIM}No posts yet. Be the first to transmit.{RESET}\n")
+                return
+            parts = []
+            for b in boards:
+                t = board_table(b)
+                parts.append(f"""
+                    SELECT u.username, t.message, t.timestamp, '{b}' AS board
+                      FROM {t} t
+                      JOIN users u ON t.user_id = u.id
+                """)
+            query = " UNION ALL ".join(parts) + " ORDER BY timestamp ASC"
+            rows = conn.execute(query).fetchall()
 
     if not rows:
-        print(f"\n  {DIM}No posts yet. Be the first to transmit.{RESET}\n")
+        if board:
+            print(f"\n  {DIM}No posts on {RESET}{PURPLE}{board}{RESET}{DIM} yet.{RESET}\n")
+        else:
+            print(f"\n  {DIM}No posts yet. Be the first to transmit.{RESET}\n")
         return
 
-    print()
-    for username, message, timestamp in rows:
-        print(format_post(username, message, timestamp))
+    label = f" on {PURPLE}{board}{RESET}" if board else ""
+    print(f"\n  {DIM}── Posts{label} {'─' * 30}{RESET}")
+    for username, message, timestamp, post_board in rows:
+        print(format_post(username, message, timestamp, post_board))
     print()
 
 
 def cmd_users() -> None:
     """
-    Print each user who has posted, ordered by their first post.
+    Print each user who has posted, ordered by first appearance.
 
-    MIN(p.id) gives us the earliest post by each user, so ORDER BY MIN(p.id)
-    preserves the same first-appearance order as the JSON version.
-    The HAVING clause is defensive — it filters out users with no posts,
-    though in practice the INSERT OR IGNORE in cmd_post means every user
-    in the users table has at least one post.
+    Since users are only created at post time (INSERT OR IGNORE), every row
+    in the users table has at least one post.  ORDER BY id preserves
+    first-appearance order because ids are auto-incremented.
     """
     with get_db() as conn:
         rows = conn.execute("""
-            SELECT u.username
-              FROM users u
-              JOIN posts p ON u.id = p.user_id
-             GROUP BY u.id
-            HAVING COUNT(p.id) > 0
-             ORDER BY MIN(p.id) ASC
+            SELECT username FROM users ORDER BY id ASC
         """).fetchall()
 
     if not rows:
@@ -190,6 +206,29 @@ def cmd_users() -> None:
     print()
     for (username,) in rows:
         print(f"  {LIME}{username}{RESET}")
+    print()
+
+
+def cmd_boards() -> None:
+    """List every board table with its post count."""
+    with get_db() as conn:
+        boards = get_board_names(conn)
+        if not boards:
+            print(f"\n  {DIM}No boards yet.{RESET}\n")
+            return
+
+        results = []
+        for b in boards:
+            t = board_table(b)
+            row = conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()
+            results.append((b, row[0]))
+
+    # Sort by count descending
+    results.sort(key=lambda x: x[1], reverse=True)
+
+    print()
+    for board_name, count in results:
+        print(f"  {LIME}{board_name}{RESET} {DIM}({count} post{'s' if count != 1 else ''}){RESET}")
     print()
 
 
@@ -223,21 +262,32 @@ def cmd_search(keyword: str) -> None:
     This is a reasonable power-user feature for a BBS search.
     """
     with get_db() as conn:
-        rows = conn.execute("""
-            SELECT u.username, p.message, p.timestamp
-              FROM posts p
-              JOIN users u ON p.user_id = u.id
-             WHERE p.message LIKE ?
-             ORDER BY p.id ASC
-        """, (f"%{keyword}%",)).fetchall()
+        boards = get_board_names(conn)
+        if not boards:
+            print(f"\n  {DIM}No posts match {RESET}{PURPLE}'{keyword}'{RESET}{DIM}.{RESET}\n")
+            return
+
+        parts = []
+        for b in boards:
+            t = board_table(b)
+            parts.append(f"""
+                SELECT u.username, t.message, t.timestamp, '{b}' AS board
+                  FROM {t} t
+                  JOIN users u ON t.user_id = u.id
+                 WHERE t.message LIKE ?
+            """)
+        query = " UNION ALL ".join(parts) + " ORDER BY timestamp ASC"
+        # Each sub-query needs its own copy of the LIKE parameter.
+        params = tuple(f"%{keyword}%" for _ in boards)
+        rows = conn.execute(query, params).fetchall()
 
     if not rows:
         print(f"\n  {DIM}No posts match {RESET}{PURPLE}'{keyword}'{RESET}{DIM}.{RESET}\n")
         return
 
     print()
-    for username, message, timestamp in rows:
-        print(format_post(username, message, timestamp))
+    for username, message, timestamp, board in rows:
+        print(format_post(username, message, timestamp, board))
     print()
 
 
@@ -265,16 +315,27 @@ def main() -> None:
         if len(sys.argv) < 4:
             print(
                 f"  {PURPLE}Usage:{RESET} python bbs_db.py post "
-                f"{WHITE}<username> <message>{RESET}",
+                f"{WHITE}<username> [board] <message>{RESET}",
                 file=sys.stderr,
             )
             sys.exit(1)
         username = sys.argv[2]
-        message  = " ".join(sys.argv[3:])   # quoting optional, same as bbs.py
-        cmd_post(username, message)
+        if len(sys.argv) == 4:
+            # post <username> <message>  →  board defaults to "general"
+            board   = "general"
+            message = sys.argv[3]
+        else:
+            # post <username> <board> <message...>
+            board   = sys.argv[3]
+            message = " ".join(sys.argv[4:])
+        cmd_post(username, board, message)
 
     elif cmd == "read":
-        cmd_read()
+        board = sys.argv[2] if len(sys.argv) >= 3 else None
+        cmd_read(board)
+
+    elif cmd == "boards":
+        cmd_boards()
 
     elif cmd == "users":
         cmd_users()

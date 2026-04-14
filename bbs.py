@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """
-bbs.py  —  Part A: JSON-backed Bulletin Board System
+bbs.py  —  Part A: JSON-backed Bulletin Board System (Silver: boards)
 
 Commands:
-    python bbs.py post <username> <message>   post a new message
-    python bbs.py read                         read all posts chronologically
-    python bbs.py users                        list users who have posted
-    python bbs.py search <keyword>             search messages (case-insensitive)
+    python bbs.py post <username> <message>               post to "general"
+    python bbs.py post <username> <board> <message>       post to a board
+    python bbs.py read                                     read all posts
+    python bbs.py read <board>                             read one board
+    python bbs.py boards                                   list all boards
+    python bbs.py users                                    list all users
+    python bbs.py search <keyword>                         search posts
 
 All data is stored as a flat JSON array in bbs.json.
 No third-party dependencies — pure Python stdlib.
@@ -103,16 +106,16 @@ def format_post(post: dict) -> str:
     """
     Render a single post record as a colored terminal line.
 
-    Example output (with color): [2026-03-24 14:01] alice: Hello, world!
-      - timestamp in purple
-      - username in lime
-      - message body in white
+    Shows a board tag for non-general boards.
     """
-    # Timestamps are stored as ISO-8601 ("2026-03-24T14:01:32").
-    # Replace the T separator and drop seconds for a cleaner display.
     ts = post["timestamp"][:16].replace("T", " ")
+    board = post.get("board", "general")
+    board_tag = ""
+    if board != "general":
+        board_tag = f"{DIM}[{RESET}{PURPLE}{board}{RESET}{DIM}]{RESET} "
     return (
         f"  {DIM}[{RESET}{PURPLE}{ts}{RESET}{DIM}]{RESET} "
+        f"{board_tag}"
         f"{LIME}{post['username']}{RESET}"
         f"{DIM}:{RESET} "
         f"{WHITE}{post['message']}{RESET}"
@@ -124,10 +127,12 @@ def print_help() -> None:
     print(BANNER)
     print(
         f"  {PURPLE}Commands:{RESET}\n"
-        f"    {LIME}post{RESET}   {WHITE}<username> <message>{RESET}   post a new message\n"
-        f"    {LIME}read{RESET}                           read all posts\n"
-        f"    {LIME}users{RESET}                          list all users\n"
-        f"    {LIME}search{RESET} {WHITE}<keyword>{RESET}              search posts (case-insensitive)\n"
+        f"    {LIME}post{RESET}   {WHITE}<user> <message>{RESET}         post to general board\n"
+        f"    {LIME}post{RESET}   {WHITE}<user> <board> <message>{RESET} post to a specific board\n"
+        f"    {LIME}read{RESET}   {WHITE}[board]{RESET}                  read posts (all or one board)\n"
+        f"    {LIME}boards{RESET}                          list all boards\n"
+        f"    {LIME}users{RESET}                           list all users\n"
+        f"    {LIME}search{RESET} {WHITE}<keyword>{RESET}               search posts (case-insensitive)\n"
     )
 
 
@@ -135,36 +140,40 @@ def print_help() -> None:
 #  Commands
 # ──────────────────────────────────────────────────────────────────────────────
 
-def cmd_post(username: str, message: str) -> None:
+def cmd_post(username: str, board: str, message: str) -> None:
     """
     Append a new post to bbs.json and print a confirmation.
-
-    Timestamps use ISO-8601 with seconds precision ("2026-03-24T14:01:32").
-    That format is both human-readable and lexicographically sortable,
-    which will matter for Part B when we migrate this data into SQL.
     """
     posts = load_posts()
     posts.append({
         "username":  username,
+        "board":     board,
         "message":   message,
         "timestamp": datetime.now().isoformat(timespec="seconds"),
     })
     save_posts(posts)
-    print(f"  {LIME}Posted.{RESET}")
+    print(f"  {LIME}Posted to {PURPLE}{board}{RESET}{LIME}.{RESET}")
 
 
-def cmd_read() -> None:
+def cmd_read(board: str | None = None) -> None:
     """
-    Print all posts in chronological order (oldest first).
+    Print posts in chronological order (oldest first).
 
-    Posts are stored in insertion order, so the JSON array is already the
-    timeline — no sorting required.
+    If board is given, only show posts from that board.
     """
     posts = load_posts()
+    if board:
+        posts = [p for p in posts if p.get("board", "general") == board]
+
     if not posts:
-        print(f"\n  {DIM}No posts yet. Be the first to transmit.{RESET}\n")
+        if board:
+            print(f"\n  {DIM}No posts on {RESET}{PURPLE}{board}{RESET}{DIM} yet.{RESET}\n")
+        else:
+            print(f"\n  {DIM}No posts yet. Be the first to transmit.{RESET}\n")
         return
-    print()
+
+    label = f" on {PURPLE}{board}{RESET}" if board else ""
+    print(f"\n  {DIM}── Posts{label} {'─' * 30}{RESET}")
     for post in posts:
         print(format_post(post))
     print()
@@ -192,6 +201,27 @@ def cmd_users() -> None:
     print()
     for username in seen:
         print(f"  {LIME}{username}{RESET}")
+    print()
+
+
+def cmd_boards() -> None:
+    """List all boards that have at least one post, with post counts."""
+    posts = load_posts()
+    if not posts:
+        print(f"\n  {DIM}No boards yet.{RESET}\n")
+        return
+
+    counts: dict[str, int] = {}
+    for post in posts:
+        b = post.get("board", "general")
+        counts[b] = counts.get(b, 0) + 1
+
+    # Sort by count descending
+    sorted_boards = sorted(counts.items(), key=lambda x: x[1], reverse=True)
+
+    print()
+    for board_name, count in sorted_boards:
+        print(f"  {LIME}{board_name}{RESET} {DIM}({count} post{'s' if count != 1 else ''}){RESET}")
     print()
 
 
@@ -233,23 +263,30 @@ def main() -> None:
     cmd = sys.argv[1].lower()
 
     if cmd == "post":
-        # Minimum: bbs.py post <username> <at-least-one-word>
         if len(sys.argv) < 4:
             print(
                 f"  {PURPLE}Usage:{RESET} python bbs.py post "
-                f"{WHITE}<username> <message>{RESET}",
+                f"{WHITE}<username> [board] <message>{RESET}",
                 file=sys.stderr,
             )
             sys.exit(1)
         username = sys.argv[2]
-        # Join all remaining args so quoting is optional:
-        #   python bbs.py post alice hello world       ← works
-        #   python bbs.py post alice "hello world"     ← also works
-        message = " ".join(sys.argv[3:])
-        cmd_post(username, message)
+        if len(sys.argv) == 4:
+            # post <username> <message>  →  board defaults to "general"
+            board   = "general"
+            message = sys.argv[3]
+        else:
+            # post <username> <board> <message...>
+            board   = sys.argv[3]
+            message = " ".join(sys.argv[4:])
+        cmd_post(username, board, message)
 
     elif cmd == "read":
-        cmd_read()
+        board = sys.argv[2] if len(sys.argv) >= 3 else None
+        cmd_read(board)
+
+    elif cmd == "boards":
+        cmd_boards()
 
     elif cmd == "users":
         cmd_users()
