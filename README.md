@@ -1,42 +1,49 @@
-# BBS - Bulletin Board System
+# JBBS - Jack's Bulletin Board System
 
-**Tier: Gold**
+## How to Run
 
-A terminal-based bulletin board system built in two versions: a JSON-backed prototype (`bbs.py`) and a SQLite-backed upgrade (`bbs_db.py`) with user authentication and an interactive session mode. A migration script (`migrate.py`) bridges the two.
+**Dependencies:** Python 3.12+ (stdlib only — no third-party packages). No `pip install` needed. The database (`bbs.db`) and JSON file (`bbs.json`) are created automatically on first use.
 
-## Setup & Running
+### Part A — JSON Version (`bbs.py`)
 
-**Dependencies:** Python 3.12+ (stdlib only — no third-party packages).
+| Command | Description |
+|---------|-------------|
+| `python bbs.py post <user> <message>` | Post to the default `general` board |
+| `python bbs.py post <user> <board> <message>` | Post to a specific board |
+| `python bbs.py read` | Read all posts across all boards |
+| `python bbs.py read <board>` | Read posts from a specific board |
+| `python bbs.py boards` | List all boards with post counts |
+| `python bbs.py users` | List all users in first-appearance order |
+| `python bbs.py search <keyword>` | Search posts by keyword (case-insensitive) |
+
+### Part B — SQLite Version (`bbs_db.py`)
+
+All Part A commands, plus:
+
+| Command | Description |
+|---------|-------------|
+| `python bbs_db.py register` | Create a new account with a password |
+| `python bbs_db.py login` | Log in and enter an interactive `jbbs>` session |
+
+### Part C — Migration (`migrate.py`)
+
+| Command | Description |
+|---------|-------------|
+| `python migrate.py` | Read `bbs.json` and populate `bbs.db` |
+
+### Testing
 
 ```bash
-# Part A — JSON version
-python bbs.py post alice "Hello, is anyone out there?"
-python bbs.py post bob general "Posting to the general board"
-python bbs.py read
-python bbs.py read general          # read a specific board
-python bbs.py boards                # list all boards
-python bbs.py users
-python bbs.py search "Hello"
-
-# Part B — SQLite version (same commands, plus auth)
-python bbs_db.py post alice "Hello from the database side"
-python bbs_db.py post alice tech "SQL is neat"
-python bbs_db.py read
-python bbs_db.py boards
-python bbs_db.py users
-python bbs_db.py search "Hello"
-
-# Gold — register and log in to an interactive session
-python bbs_db.py register
-python bbs_db.py login
-
-# Part C — migrate JSON data into SQLite
-python migrate.py
+python -m pytest test_bbs.py -v
 ```
 
-No `pip install` needed. The database (`bbs.db`) and JSON file (`bbs.json`) are created automatically on first use.
+31 end-to-end tests covering all three parts. Tests run each program as a subprocess, strip ANSI codes for clean assertions, and clean up generated files automatically.
 
-## Search: JSON vs. SQL
+## Tier
+
+**Gold.**
+
+## Search Comparison
 
 In the JSON version, search loads the entire `bbs.json` file into memory as a Python list, then iterates over every post and checks whether the keyword appears in the message using a case-insensitive string comparison (`keyword.lower() in message.lower()`). Every single post is deserialized and examined regardless of whether it matches. The work scales linearly with the total number of posts — O(n) — and it all happens in the application layer.
 
@@ -56,7 +63,7 @@ I chose merge-and-reorder over "skip duplicates" or "error out" because it's the
 
 If `bbs.json` doesn't exist or is empty, the script prints a message and exits — it won't touch the database.
 
-## Silver Feature: Boards
+## Silver: Boards
 
 Posts belong to named boards. The default board is `general`, but you can target any board:
 
@@ -70,11 +77,11 @@ In the JSON version, boards are stored as a `"board"` field on each post object.
 
 Board names are validated with a regex (`^[a-zA-Z0-9_]+$`) before being interpolated into SQL, since table names can't use parameterized placeholders.
 
-## Gold Features
+## Gold: ASCII Art, Colored Output, and Persistent Logins
 
 ### ASCII Art & Colored Output
 
-Both versions display an ASCII art banner (block-letter "BBS" using box-drawing characters) when run with no arguments. All output uses a consistent ANSI 256-color palette — lime green for usernames and success messages, purple for timestamps and borders, dim text for secondary info. This gives it the retro-terminal feel of an actual BBS.
+Both versions display an ASCII art banner (block-letter "JBBS" using box-drawing characters) when run with no arguments. All output uses a consistent ANSI 256-color palette — lime green for usernames and success messages, purple for timestamps and borders, dim text for secondary info. This gives it the retro-terminal feel of an actual BBS.
 
 ### User Accounts & Interactive Sessions
 
@@ -82,26 +89,16 @@ The SQLite version adds `register` and `login` commands. Passwords are hashed wi
 
 Users created via CLI posts (before registering) have a `NULL` password hash. Running `register` with that username lets you "claim" the account by setting a password, so no posts are lost.
 
-After logging in, you enter a persistent `bbs>` prompt — an interactive REPL where your username is implicit:
+After logging in, you enter a persistent `jbbs>` prompt — an interactive REPL where your username is implicit:
 
 ```
-bbs> post Hello everyone!              # posts as you, to general
-bbs> post #tech Check this out         # posts to the tech board
-bbs> read
-bbs> boards
-bbs> search Hello
-bbs> whoami
-bbs> quit
+jbbs> post Hello everyone!              # posts as you, to general
+jbbs> post #tech Check this out         # posts to the tech board
+jbbs> read
+jbbs> boards
+jbbs> search Hello
+jbbs> whoami
+jbbs> quit
 ```
 
 This required adding the `password_hash` column to the `users` table. The schema auto-migrates: if an older database lacks the column, `init_db()` adds it with `ALTER TABLE` on startup, so nothing breaks.
-
-## Testing
-
-The test suite (`test_bbs.py`) covers all three parts with 31 end-to-end tests:
-
-```bash
-python -m pytest test_bbs.py -v
-```
-
-Tests run each program as a subprocess (simulating real CLI usage), strip ANSI codes from output for clean assertions, and clean up generated files automatically.

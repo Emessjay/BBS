@@ -49,7 +49,7 @@ def hash_password(password: str) -> str:
     Return a salted PBKDF2-SHA256 hash as  salt_hex:key_hex.
 
     Uses 16 random bytes of salt and 100 000 iterations — strong enough
-    for a BBS while staying in the stdlib (no bcrypt dependency).
+    for JBBS while staying in the stdlib (no bcrypt dependency).
     """
     salt = os.urandom(16)
     key = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 100_000)

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-test_bbs.py  —  End-to-end test suite for the BBS system (Parts A, B, and C).
+test_bbs.py  —  End-to-end test suite for JBBS (Parts A, B, and C).
 
 Runs bbs.py, bbs_db.py, and migrate.py as subprocesses — the same way a user
 would — and checks their output and side effects (JSON file contents, DB rows).
@@ -45,7 +45,7 @@ def strip_ansi(text: str) -> str:
 
 def run(script: str, *args: str) -> tuple[str, int]:
     """
-    Run a BBS script as a subprocess and return (plain-text output, exit code).
+    Run a JBBS script as a subprocess and return (plain-text output, exit code).
 
     stdout and stderr are merged and ANSI-stripped so tests can do simple
     string-in-string checks without worrying about color codes.
@@ -61,7 +61,7 @@ def run(script: str, *args: str) -> tuple[str, int]:
 
 def run_interactive(script: str, *args: str, stdin_text: str = "") -> tuple[str, int]:
     """
-    Run a BBS script with stdin piped in (for register/login prompts).
+    Run a JBBS script with stdin piped in (for register/login prompts).
 
     getpass reads from /dev/tty by default, so we set the PYTHONPATH env
     and monkey-patch getpass via -c isn't practical.  Instead we set the
@@ -82,7 +82,7 @@ def run_interactive(script: str, *args: str, stdin_text: str = "") -> tuple[str,
 
 
 def cleanup() -> None:
-    """Remove every file the BBS scripts might create."""
+    """Remove every file the JBBS scripts might create."""
     for path in [JSON_FILE, DB_FILE]:
         if os.path.exists(path):
             os.remove(path)
@@ -785,7 +785,7 @@ TESTS = [
 
 
 def main() -> None:
-    print(f"\n  {PURPLE}BBS Test Suite{RESET}  {DIM}({len(TESTS)} tests){RESET}\n")
+    print(f"\n  {PURPLE}JBBS Test Suite{RESET}  {DIM}({len(TESTS)} tests){RESET}\n")
 
     passed = 0
     failed = 0

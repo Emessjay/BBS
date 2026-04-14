@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-bbs_db.py  —  SQLite-backed Bulletin Board System (Gold: interactive sessions)
+bbs_db.py  —  SQLite-backed Jack's Bulletin Board System (Gold: interactive sessions)
 
 One-shot commands:
     python bbs_db.py post <username> <message>               post to "general"
@@ -13,7 +13,7 @@ One-shot commands:
 
 Interactive mode (Gold):
     python bbs_db.py register                                 create an account
-    python bbs_db.py login                                    log in → bbs> session
+    python bbs_db.py login                                    log in → jbbs> session
 
 Data is stored in bbs.db (SQLite).  Schema is managed by db.py.
 
@@ -53,17 +53,17 @@ RESET  = "\033[0m"
 # ──────────────────────────────────────────────────────────────────────────────
 BANNER = (
     "\n"
-    f"  {PURPLE}╔{'═' * 44}╗{RESET}\n"
-    f"  {PURPLE}║  {LIME}██████╗ ██████╗ ███████╗{PURPLE}                  ║{RESET}\n"
-    f"  {PURPLE}║  {LIME}██╔══██╗██╔══██╗██╔════╝{PURPLE}                  ║{RESET}\n"
-    f"  {PURPLE}║  {LIME}██████╔╝██████╔╝███████╗{PURPLE}                  ║{RESET}\n"
-    f"  {PURPLE}║  {LIME}██╔══██╗██╔══██╗╚════██║{PURPLE}                  ║{RESET}\n"
-    f"  {PURPLE}║  {LIME}██████╔╝██████╔╝███████║{PURPLE}                  ║{RESET}\n"
-    f"  {PURPLE}║  {LIME}╚═════╝ ╚═════╝ ╚══════╝{PURPLE}                  ║{RESET}\n"
-    f"  {PURPLE}║{'':44}║{RESET}\n"
-    f"  {PURPLE}║  {LIME}BULLETIN BOARD SYSTEM{PURPLE}  {DIM}//{RESET}  {WHITE}SQLITE v2.0{RESET}    {PURPLE}║{RESET}\n"
-    f"  {PURPLE}║{'':44}║{RESET}\n"
-    f"  {PURPLE}╚{'═' * 44}╝{RESET}\n"
+    f"  {PURPLE}╔{'═' * 52}╗{RESET}\n"
+    f"  {PURPLE}║  {LIME}     ██╗ ██████╗ ██████╗ ███████╗{PURPLE}                 ║{RESET}\n"
+    f"  {PURPLE}║  {LIME}     ██║ ██╔══██╗██╔══██╗██╔════╝{PURPLE}                 ║{RESET}\n"
+    f"  {PURPLE}║  {LIME}     ██║ ██████╔╝██████╔╝███████╗{PURPLE}                 ║{RESET}\n"
+    f"  {PURPLE}║  {LIME}██   ██║ ██╔══██╗██╔══██╗╚════██║{PURPLE}                 ║{RESET}\n"
+    f"  {PURPLE}║  {LIME}╚█████╔╝ ██████╔╝██████╔╝███████║{PURPLE}                 ║{RESET}\n"
+    f"  {PURPLE}║  {LIME} ╚════╝  ╚═════╝ ╚═════╝ ╚══════╝{PURPLE}                 ║{RESET}\n"
+    f"  {PURPLE}║{'':52}║{RESET}\n"
+    f"  {PURPLE}║  {LIME}JACK'S BULLETIN BOARD SYSTEM{PURPLE}  {DIM}//{RESET}  {WHITE}SQLITE v2.0{RESET}     {PURPLE}║{RESET}\n"
+    f"  {PURPLE}║{'':52}║{RESET}\n"
+    f"  {PURPLE}╚{'═' * 52}╝{RESET}\n"
 )
 
 
@@ -431,7 +431,7 @@ def cmd_login() -> None:
 
 def interactive_session(username: str, user_id: int) -> None:
     """
-    REPL loop that keeps the user "logged in" with a bbs> prompt.
+    REPL loop that keeps the user "logged in" with a jbbs> prompt.
 
     The username is implicit — posts don't require it as an argument.
     All one-shot commands (read, boards, users, search) work the same way.
@@ -445,7 +445,7 @@ def interactive_session(username: str, user_id: int) -> None:
 
     while True:
         try:
-            raw = input(f"  {PURPLE}bbs>{RESET} ").strip()
+            raw = input(f"  {PURPLE}jbbs>{RESET} ").strip()
         except (EOFError, KeyboardInterrupt):
             print()
             break

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-bbs.py  —  Part A: JSON-backed Bulletin Board System (Silver: boards)
+bbs.py  —  Part A: JSON-backed Jack's Bulletin Board System (Silver: boards)
 
 Commands:
     python bbs.py post <username> <message>               post to "general"
@@ -50,17 +50,17 @@ BBS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bbs.json")
 # ──────────────────────────────────────────────────────────────────────────────
 BANNER = (
     "\n"
-    f"  {PURPLE}╔{'═' * 44}╗{RESET}\n"
-    f"  {PURPLE}║  {LIME}██████╗ ██████╗ ███████╗{PURPLE}                  ║{RESET}\n"
-    f"  {PURPLE}║  {LIME}██╔══██╗██╔══██╗██╔════╝{PURPLE}                  ║{RESET}\n"
-    f"  {PURPLE}║  {LIME}██████╔╝██████╔╝███████╗{PURPLE}                  ║{RESET}\n"
-    f"  {PURPLE}║  {LIME}██╔══██╗██╔══██╗╚════██║{PURPLE}                  ║{RESET}\n"
-    f"  {PURPLE}║  {LIME}██████╔╝██████╔╝███████║{PURPLE}                  ║{RESET}\n"
-    f"  {PURPLE}║  {LIME}╚═════╝ ╚═════╝ ╚══════╝{PURPLE}                  ║{RESET}\n"
-    f"  {PURPLE}║{'':44}║{RESET}\n"
-    f"  {PURPLE}║  {LIME}BULLETIN BOARD SYSTEM{PURPLE}  {DIM}//{RESET}  {WHITE}JSON v1.0{RESET}      {PURPLE}║{RESET}\n"
-    f"  {PURPLE}║{'':44}║{RESET}\n"
-    f"  {PURPLE}╚{'═' * 44}╝{RESET}\n"
+    f"  {PURPLE}╔{'═' * 52}╗{RESET}\n"
+    f"  {PURPLE}║  {LIME}     ██╗ ██████╗ ██████╗ ███████╗{PURPLE}                 ║{RESET}\n"
+    f"  {PURPLE}║  {LIME}     ██║ ██╔══██╗██╔══██╗██╔════╝{PURPLE}                 ║{RESET}\n"
+    f"  {PURPLE}║  {LIME}     ██║ ██████╔╝██████╔╝███████╗{PURPLE}                 ║{RESET}\n"
+    f"  {PURPLE}║  {LIME}██   ██║ ██╔══██╗██╔══██╗╚════██║{PURPLE}                 ║{RESET}\n"
+    f"  {PURPLE}║  {LIME}╚█████╔╝ ██████╔╝██████╔╝███████║{PURPLE}                 ║{RESET}\n"
+    f"  {PURPLE}║  {LIME} ╚════╝  ╚═════╝ ╚═════╝ ╚══════╝{PURPLE}                 ║{RESET}\n"
+    f"  {PURPLE}║{'':52}║{RESET}\n"
+    f"  {PURPLE}║  {LIME}JACK'S BULLETIN BOARD SYSTEM{PURPLE}  {DIM}//{RESET}  {WHITE}JSON v1.0{RESET}       {PURPLE}║{RESET}\n"
+    f"  {PURPLE}║{'':52}║{RESET}\n"
+    f"  {PURPLE}╚{'═' * 52}╝{RESET}\n"
 )
 
 
