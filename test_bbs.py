@@ -59,6 +59,28 @@ def run(script: str, *args: str) -> tuple[str, int]:
     return strip_ansi(combined), result.returncode
 
 
+def run_interactive(script: str, *args: str, stdin_text: str = "") -> tuple[str, int]:
+    """
+    Run a BBS script with stdin piped in (for register/login prompts).
+
+    getpass reads from /dev/tty by default, so we set the PYTHONPATH env
+    and monkey-patch getpass via -c isn't practical.  Instead we set the
+    env var TERM=dumb and pipe input; getpass falls back to stdin when
+    there's no tty.
+    """
+    env = os.environ.copy()
+    env["TERM"] = "dumb"
+    result = subprocess.run(
+        [sys.executable, os.path.join(SCRIPT_DIR, script), *args],
+        input=stdin_text,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    combined = result.stdout + result.stderr
+    return strip_ansi(combined), result.returncode
+
+
 def cleanup() -> None:
     """Remove every file the BBS scripts might create."""
     for path in [JSON_FILE, DB_FILE]:
@@ -498,6 +520,188 @@ def test_migrate_output_matches():
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+#  Gold — Registration, Login & Interactive Session
+# ──────────────────────────────────────────────────────────────────────────────
+
+def test_register_new_user():
+    """Register a brand-new user with matching passwords."""
+    cleanup()
+
+    # Stdin: username, password, confirm password
+    output, code = run_interactive(
+        "bbs_db.py", "register",
+        stdin_text="testuser\nsecret123\nsecret123\n",
+    )
+    assert code == 0
+    assert "Registered" in output or "registered" in output.lower()
+
+    # Verify the user row was created with a password hash.
+    rows = query_db("SELECT username, password_hash FROM users WHERE username = 'testuser'")
+    assert len(rows) == 1
+    assert rows[0][1] is not None  # password_hash should be set
+
+
+def test_register_duplicate_user():
+    """Registering an already-registered user prints an error."""
+    # testuser was registered in the previous test; register again.
+    output, code = run_interactive(
+        "bbs_db.py", "register",
+        stdin_text="testuser\nsecret123\nsecret123\n",
+    )
+    assert "already registered" in output.lower()
+
+
+def test_register_password_mismatch():
+    """Mismatched passwords should be rejected."""
+    cleanup()
+
+    output, code = run_interactive(
+        "bbs_db.py", "register",
+        stdin_text="mismatchuser\nabc\nxyz\n",
+    )
+    assert "do not match" in output.lower()
+
+    # User should NOT have been created.
+    rows = query_db("SELECT * FROM users WHERE username = 'mismatchuser'")
+    assert len(rows) == 0
+
+
+def test_register_claim_existing_cli_user():
+    """A user created via CLI post (no password) can register to set one."""
+    cleanup()
+
+    # Create a user via one-shot post (no password).
+    run("bbs_db.py", "post", "cliuser", "hello from CLI")
+
+    # That user should exist but with no password.
+    rows = query_db("SELECT password_hash FROM users WHERE username = 'cliuser'")
+    assert len(rows) == 1
+    assert rows[0][0] is None
+
+    # Now register that user — sets their password.
+    output, code = run_interactive(
+        "bbs_db.py", "register",
+        stdin_text="cliuser\nmypass\nmypass\n",
+    )
+    assert code == 0
+    assert "Password set" in output or "password set" in output.lower()
+
+    # Password hash should now be populated.
+    rows = query_db("SELECT password_hash FROM users WHERE username = 'cliuser'")
+    assert rows[0][0] is not None
+
+
+def test_login_unknown_user():
+    """Logging in with a non-existent username prints an error."""
+    cleanup()
+
+    output, code = run_interactive(
+        "bbs_db.py", "login",
+        stdin_text="nobody\n",
+    )
+    assert "unknown user" in output.lower() or "register" in output.lower()
+
+
+def test_login_wrong_password():
+    """Logging in with the wrong password is rejected."""
+    cleanup()
+
+    # Register a user first.
+    run_interactive("bbs_db.py", "register", stdin_text="secuser\ncorrect\ncorrect\n")
+
+    # Try to log in with the wrong password.
+    output, code = run_interactive(
+        "bbs_db.py", "login",
+        stdin_text="secuser\nwrong\n",
+    )
+    assert "wrong password" in output.lower()
+
+
+def test_interactive_session():
+    """Log in and run commands inside the interactive session."""
+    cleanup()
+
+    # Register, then log in and run some session commands.
+    run_interactive("bbs_db.py", "register", stdin_text="sessuser\npass\npass\n")
+
+    # Login + session commands piped via stdin.
+    # Commands: whoami, post a message, read, quit
+    session_input = "\n".join([
+        "sessuser",      # username prompt
+        "pass",          # password prompt
+        "whoami",        # session command
+        "post Hello from session!",
+        "read",
+        "quit",
+    ]) + "\n"
+
+    output, code = run_interactive("bbs_db.py", "login", stdin_text=session_input)
+    assert code == 0
+    assert "sessuser" in output       # whoami output
+    assert "Hello from session!" in output  # post should appear in read
+    assert "Goodbye" in output        # quit message
+
+
+def test_interactive_post_to_board():
+    """Session post with a board name posts to that board."""
+    cleanup()
+
+    run_interactive("bbs_db.py", "register", stdin_text="boarduser\npass\npass\n")
+
+    session_input = "\n".join([
+        "boarduser",
+        "pass",
+        "post #tech Discussing databases",
+        "boards",
+        "read tech",
+        "quit",
+    ]) + "\n"
+
+    output, code = run_interactive("bbs_db.py", "login", stdin_text=session_input)
+    assert code == 0
+    assert "tech" in output
+    assert "Discussing databases" in output
+
+
+def test_password_hash_schema_upgrade():
+    """init_db() adds password_hash column to an older DB missing it."""
+    cleanup()
+
+    # Create a DB with the OLD schema (no password_hash column).
+    import sqlite3 as _sqlite3
+    conn = _sqlite3.connect(DB_FILE)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id       INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT    NOT NULL UNIQUE
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS board_general (
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id   INTEGER NOT NULL REFERENCES users(id),
+            message   TEXT    NOT NULL,
+            timestamp TEXT    NOT NULL
+        )
+    """)
+    conn.execute("INSERT INTO users (username) VALUES ('olduser')")
+    conn.commit()
+    conn.close()
+
+    # Running any bbs_db.py command triggers init_db(), which should
+    # ALTER TABLE to add the missing column.
+    output, code = run("bbs_db.py", "users")
+    assert code == 0
+    assert "olduser" in output
+
+    # Verify the column now exists.
+    conn = _sqlite3.connect(DB_FILE)
+    cols = [row[1] for row in conn.execute("PRAGMA table_info(users)").fetchall()]
+    conn.close()
+    assert "password_hash" in cols
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 #  Error handling
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -563,6 +767,16 @@ TESTS = [
     test_migrate_merge_chronological_ids,
     test_migrate_backup_created,           # depends on merge test above
     test_migrate_output_matches,
+    # Gold — Registration, Login & Interactive Session
+    test_register_new_user,
+    test_register_duplicate_user,       # depends on register_new_user above
+    test_register_password_mismatch,
+    test_register_claim_existing_cli_user,
+    test_login_unknown_user,
+    test_login_wrong_password,
+    test_interactive_session,
+    test_interactive_post_to_board,
+    test_password_hash_schema_upgrade,
     # Errors
     test_error_unknown_command,
     test_error_post_missing_args,

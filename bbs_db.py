@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-bbs_db.py  —  Part B: SQLite-backed Bulletin Board System (Silver: boards)
+bbs_db.py  —  SQLite-backed Bulletin Board System (Gold: interactive sessions)
 
-Commands:
+One-shot commands:
     python bbs_db.py post <username> <message>               post to "general"
     python bbs_db.py post <username> <board> <message>       post to a board
     python bbs_db.py read                                     read all posts
@@ -10,6 +10,10 @@ Commands:
     python bbs_db.py boards                                   list all boards
     python bbs_db.py users                                    list all users
     python bbs_db.py search <keyword>                         search posts
+
+Interactive mode (Gold):
+    python bbs_db.py register                                 create an account
+    python bbs_db.py login                                    log in → bbs> session
 
 Data is stored in bbs.db (SQLite).  Schema is managed by db.py.
 
@@ -22,10 +26,14 @@ reach the database engine, making injection impossible.
 """
 
 import sys
-import os
+import getpass
+import shlex
 from datetime import datetime
 
-from db import get_db, init_db, board_table, create_board, get_board_names
+from db import (
+    get_db, init_db, board_table, create_board, get_board_names,
+    hash_password, verify_password,
+)
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  Terminal color constants  (ANSI 256-color escape codes)
@@ -53,7 +61,7 @@ BANNER = (
     f"  {PURPLE}║  {LIME}██████╔╝██████╔╝███████║{PURPLE}                  ║{RESET}\n"
     f"  {PURPLE}║  {LIME}╚═════╝ ╚═════╝ ╚══════╝{PURPLE}                  ║{RESET}\n"
     f"  {PURPLE}║{'':44}║{RESET}\n"
-    f"  {PURPLE}║  {LIME}BULLETIN BOARD SYSTEM{PURPLE}  {DIM}//{RESET}  {WHITE}SQLITE v1.0{RESET}    {PURPLE}║{RESET}\n"
+    f"  {PURPLE}║  {LIME}BULLETIN BOARD SYSTEM{PURPLE}  {DIM}//{RESET}  {WHITE}SQLITE v2.0{RESET}    {PURPLE}║{RESET}\n"
     f"  {PURPLE}║{'':44}║{RESET}\n"
     f"  {PURPLE}╚{'═' * 44}╝{RESET}\n"
 )
@@ -88,13 +96,33 @@ def print_help() -> None:
     """Display the splash banner followed by a compact command reference."""
     print(BANNER)
     print(
-        f"  {PURPLE}Commands:{RESET}\n"
-        f"    {LIME}post{RESET}   {WHITE}<user> <message>{RESET}         post to general board\n"
-        f"    {LIME}post{RESET}   {WHITE}<user> <board> <message>{RESET} post to a specific board\n"
-        f"    {LIME}read{RESET}   {WHITE}[board]{RESET}                  read posts (all or one board)\n"
-        f"    {LIME}boards{RESET}                          list all boards\n"
-        f"    {LIME}users{RESET}                           list all users\n"
-        f"    {LIME}search{RESET} {WHITE}<keyword>{RESET}               search posts (case-insensitive)\n"
+        f"  {PURPLE}One-shot commands:{RESET}\n"
+        f"    {LIME}post{RESET}     {WHITE}<user> <message>{RESET}         post to general board\n"
+        f"    {LIME}post{RESET}     {WHITE}<user> <board> <message>{RESET} post to a specific board\n"
+        f"    {LIME}read{RESET}     {WHITE}[board]{RESET}                  read posts (all or one board)\n"
+        f"    {LIME}boards{RESET}                            list all boards\n"
+        f"    {LIME}users{RESET}                             list all users\n"
+        f"    {LIME}search{RESET}   {WHITE}<keyword>{RESET}               search posts (case-insensitive)\n"
+        f"\n"
+        f"  {PURPLE}Interactive mode:{RESET}\n"
+        f"    {LIME}register{RESET}                          create a new account\n"
+        f"    {LIME}login{RESET}                             log in to a live session\n"
+    )
+
+
+def print_session_help() -> None:
+    """Display help for the interactive session."""
+    print(
+        f"\n  {PURPLE}Session commands:{RESET}\n"
+        f"    {LIME}post{RESET}   {WHITE}<message>{RESET}               post to general board\n"
+        f"    {LIME}post{RESET}   {WHITE}#<board> <message>{RESET}      post to a specific board\n"
+        f"    {LIME}read{RESET}   {WHITE}[board]{RESET}                 read posts (all or one board)\n"
+        f"    {LIME}boards{RESET}                           list all boards\n"
+        f"    {LIME}users{RESET}                            list all users\n"
+        f"    {LIME}search{RESET} {WHITE}<keyword>{RESET}              search posts (case-insensitive)\n"
+        f"    {LIME}whoami{RESET}                           show current user\n"
+        f"    {LIME}help{RESET}                             show this help\n"
+        f"    {LIME}quit{RESET}                             log out and exit\n"
     )
 
 
@@ -292,6 +320,197 @@ def cmd_search(keyword: str) -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+#  Registration & Login
+# ──────────────────────────────────────────────────────────────────────────────
+
+def cmd_register() -> None:
+    """
+    Create a new user account with a password.
+
+    Prompts interactively for username and password (password hidden).
+    The password is hashed with PBKDF2-SHA256 before storage.
+    """
+    print(f"\n  {PURPLE}── Register {'─' * 30}{RESET}\n")
+
+    username = input(f"  {WHITE}Username:{RESET} ").strip()
+    if not username:
+        print(f"  {PURPLE}Error:{RESET} username cannot be empty.")
+        return
+
+    with get_db() as conn:
+        existing = conn.execute(
+            "SELECT id, password_hash FROM users WHERE username = ?",
+            (username,),
+        ).fetchone()
+        if existing:
+            if existing[1]:
+                print(f"  {PURPLE}Error:{RESET} user {LIME}{username}{RESET} is already registered.")
+                return
+            # User exists from a CLI post but has no password — let them claim it.
+            pw = getpass.getpass(f"  {WHITE}Password:{RESET} ")
+            if len(pw) < 1:
+                print(f"  {PURPLE}Error:{RESET} password cannot be empty.")
+                return
+            pw2 = getpass.getpass(f"  {WHITE}Confirm:{RESET}  ")
+            if pw != pw2:
+                print(f"  {PURPLE}Error:{RESET} passwords do not match.")
+                return
+            conn.execute(
+                "UPDATE users SET password_hash = ? WHERE id = ?",
+                (hash_password(pw), existing[0]),
+            )
+            print(f"\n  {LIME}Password set for {PURPLE}{username}{RESET}{LIME}. You can now log in.{RESET}\n")
+            return
+
+    # Brand-new user.
+    pw = getpass.getpass(f"  {WHITE}Password:{RESET} ")
+    if len(pw) < 1:
+        print(f"  {PURPLE}Error:{RESET} password cannot be empty.")
+        return
+    pw2 = getpass.getpass(f"  {WHITE}Confirm:{RESET}  ")
+    if pw != pw2:
+        print(f"  {PURPLE}Error:{RESET} passwords do not match.")
+        return
+
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO users (username, password_hash) VALUES (?, ?)",
+            (username, hash_password(pw)),
+        )
+    print(f"\n  {LIME}Registered {PURPLE}{username}{RESET}{LIME}. You can now log in.{RESET}\n")
+
+
+def cmd_login() -> None:
+    """
+    Authenticate a user then drop into an interactive session.
+
+    Users without a password (legacy CLI-created) are prompted to register.
+    """
+    print(f"\n  {PURPLE}── Login {'─' * 33}{RESET}\n")
+
+    username = input(f"  {WHITE}Username:{RESET} ").strip()
+    if not username:
+        print(f"  {PURPLE}Error:{RESET} username cannot be empty.")
+        return
+
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT id, password_hash FROM users WHERE username = ?",
+            (username,),
+        ).fetchone()
+
+    if not row:
+        print(
+            f"  {PURPLE}Error:{RESET} unknown user {WHITE}{username}{RESET}. "
+            f"Run {LIME}register{RESET} first."
+        )
+        return
+
+    user_id, pw_hash = row
+    if not pw_hash:
+        print(
+            f"  {PURPLE}Error:{RESET} {WHITE}{username}{RESET} has no password. "
+            f"Run {LIME}register{RESET} to set one."
+        )
+        return
+
+    pw = getpass.getpass(f"  {WHITE}Password:{RESET} ")
+    if not verify_password(pw, pw_hash):
+        print(f"  {PURPLE}Error:{RESET} wrong password.")
+        return
+
+    # Success → enter the interactive session.
+    interactive_session(username, user_id)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Interactive session  (Gold feature)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def interactive_session(username: str, user_id: int) -> None:
+    """
+    REPL loop that keeps the user "logged in" with a bbs> prompt.
+
+    The username is implicit — posts don't require it as an argument.
+    All one-shot commands (read, boards, users, search) work the same way.
+    Type 'quit', 'exit', or 'logout' to leave.
+    """
+    print(
+        f"\n  {LIME}Logged in as {PURPLE}{username}{RESET}"
+        f"  {DIM}(type {RESET}{LIME}help{RESET}{DIM} for commands, "
+        f"{RESET}{LIME}quit{RESET}{DIM} to leave){RESET}\n"
+    )
+
+    while True:
+        try:
+            raw = input(f"  {PURPLE}bbs>{RESET} ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+
+        if not raw:
+            continue
+
+        try:
+            parts = shlex.split(raw)
+        except ValueError:
+            parts = raw.split()
+
+        cmd = parts[0].lower()
+
+        if cmd in ("quit", "exit", "logout"):
+            print(f"\n  {DIM}Goodbye, {RESET}{LIME}{username}{RESET}{DIM}.{RESET}\n")
+            break
+
+        elif cmd == "help":
+            print_session_help()
+
+        elif cmd == "whoami":
+            print(f"\n  {LIME}{username}{RESET}\n")
+
+        elif cmd == "post":
+            if len(parts) < 2:
+                print(f"  {PURPLE}Usage:{RESET} post {WHITE}[#board] <message>{RESET}")
+                continue
+            # A leading #board tag targets a specific board.
+            # e.g.  post #tech Great article!
+            # Without it, everything goes to "general".
+            if parts[1].startswith("#") and len(parts[1]) > 1:
+                board = parts[1][1:]   # strip the '#'
+                message = " ".join(parts[2:]) if len(parts) >= 3 else ""
+                if not message:
+                    print(f"  {PURPLE}Usage:{RESET} post {WHITE}#board <message>{RESET}")
+                    continue
+            else:
+                board = "general"
+                message = " ".join(parts[1:])
+            cmd_post(username, board, message)
+
+        elif cmd == "read":
+            board = parts[1] if len(parts) >= 2 else None
+            cmd_read(board)
+
+        elif cmd == "boards":
+            cmd_boards()
+
+        elif cmd == "users":
+            cmd_users()
+
+        elif cmd == "search":
+            if len(parts) < 2:
+                print(f"  {PURPLE}Usage:{RESET} search {WHITE}<keyword>{RESET}")
+                continue
+            keyword = " ".join(parts[1:])
+            cmd_search(keyword)
+
+        else:
+            print(
+                f"  {PURPLE}Unknown command:{RESET} {WHITE}{cmd}{RESET}  "
+                f"{DIM}(type {RESET}{LIME}help{RESET}{DIM} for commands){RESET}"
+            )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 #  Entry point
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -349,6 +568,12 @@ def main() -> None:
             sys.exit(1)
         keyword = " ".join(sys.argv[2:])
         cmd_search(keyword)
+
+    elif cmd == "register":
+        cmd_register()
+
+    elif cmd == "login":
+        cmd_login()
 
     else:
         print(

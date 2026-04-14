@@ -8,12 +8,15 @@ Exports:
     board_table()  — returns the sanitised table name for a board
     create_board() — creates a board table if it doesn't exist
     get_board_names() — lists all board names from sqlite_master
+    hash_password()   — returns a salted PBKDF2 hash string
+    verify_password() — checks a plaintext password against a stored hash
 
 Schema
 ──────
   users
-    id        INTEGER  primary key, auto-increment
-    username  TEXT     unique, not null
+    id            INTEGER  primary key, auto-increment
+    username      TEXT     unique, not null
+    password_hash TEXT     nullable (NULL for legacy/CLI-created users)
 
   board_<name>   (one table per board, e.g. board_general, board_tech)
     id        INTEGER  primary key, auto-increment
@@ -28,6 +31,7 @@ rows from other boards — no filtering required, just a direct table scan.
 import re
 import sqlite3
 import os
+import hashlib
 from contextlib import contextmanager
 
 # bbs.db lives next to this script regardless of the working directory.
@@ -37,6 +41,26 @@ DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bbs.db")
 # This is critical because table names can't use ? placeholders,
 # so we validate the name before interpolating it into SQL.
 _BOARD_NAME_RE = re.compile(r'^[a-zA-Z0-9_]+$')
+
+
+def hash_password(password: str) -> str:
+    """
+    Return a salted PBKDF2-SHA256 hash as  salt_hex:key_hex.
+
+    Uses 16 random bytes of salt and 100 000 iterations — strong enough
+    for a BBS while staying in the stdlib (no bcrypt dependency).
+    """
+    salt = os.urandom(16)
+    key = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 100_000)
+    return salt.hex() + ":" + key.hex()
+
+
+def verify_password(password: str, stored: str) -> bool:
+    """Check a plaintext password against a hash produced by hash_password()."""
+    salt_hex, key_hex = stored.split(":")
+    salt = bytes.fromhex(salt_hex)
+    key = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 100_000)
+    return key.hex() == key_hex
 
 
 def board_table(name: str) -> str:
@@ -102,12 +126,20 @@ def init_db() -> None:
     Create the users table and the default "general" board table.
 
     Safe to call on every startup — uses CREATE TABLE IF NOT EXISTS.
+    If the users table already exists but lacks the password_hash column
+    (pre-Gold schema), ALTER TABLE adds it non-destructively.
     """
     with get_db() as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
-                id       INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT    NOT NULL UNIQUE
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                username      TEXT    NOT NULL UNIQUE,
+                password_hash TEXT
             )
         """)
+        # Migrate older databases that lack the password_hash column.
+        columns = [row[1] for row in conn.execute("PRAGMA table_info(users)").fetchall()]
+        if "password_hash" not in columns:
+            conn.execute("ALTER TABLE users ADD COLUMN password_hash TEXT")
+
         create_board(conn, "general")
