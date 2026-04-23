@@ -1,31 +1,45 @@
 """
-db.py  —  SQLite connection helper for bbs_db.py
+db.py  —  SQLite helpers for the CLI-based JBBS (bbs_db.py, migrate.py).
 
 Exports:
-    DB_FILE        — absolute path to bbs.db
-    get_db()       — context manager that yields a live connection
-    init_db()      — creates the users table and the default "general" board
-    board_table()  — returns the sanitised table name for a board
-    create_board() — creates a board table if it doesn't exist
-    get_board_names() — lists all board names from sqlite_master
-    hash_password()   — returns a salted PBKDF2 hash string
-    verify_password() — checks a plaintext password against a stored hash
+    DB_FILE             — absolute path to bbs.db
+    get_db()            — context manager that yields a live connection
+    init_db()           — creates the users and posts tables
+    validate_board()    — raises ValueError if a board name is unsafe
+    hash_password()     — returns a salted PBKDF2 hash string
+    verify_password()   — checks a plaintext password against a stored hash
 
-Schema
+SCHEMA
 ──────
   users
-    id            INTEGER  primary key, auto-increment
-    username      TEXT     unique, not null
-    password_hash TEXT     nullable (NULL for legacy/CLI-created users)
+    id             INTEGER  primary key, auto-increment
+    username       TEXT     unique, not null
+    password_hash  TEXT     nullable (NULL for CLI-created users who
+                            never registered a password)
 
-  board_<name>   (one table per board, e.g. board_general, board_tech)
+  posts
     id        INTEGER  primary key, auto-increment
     user_id   INTEGER  foreign key → users.id, not null
+    board     TEXT     not null, default 'general'
     message   TEXT     not null
     timestamp TEXT     ISO-8601, e.g. "2026-03-24T14:01:32"
 
-Each board gets its own table so reading a single board never touches
-rows from other boards — no filtering required, just a direct table scan.
+WHY ONE posts TABLE INSTEAD OF ONE TABLE PER BOARD
+───────────────────────────────────────────────────
+An earlier version used a separate table per board (board_general,
+board_tech, etc.).  That design had two real costs:
+
+  1. "All posts by user X" turned into either N queries (one per
+     board) or a mess of UNION ALL SQL.  With a single posts table
+     it is a plain JOIN.
+
+  2. "All boards" had to read sqlite_master to discover table names,
+     then issue a COUNT query per table.  Now it is one GROUP BY.
+
+The new design keeps the board identity right on the row.  There is
+no separate `boards` table — a board exists exactly when at least
+one post references it (queries use `SELECT DISTINCT board`).  That
+matches the BBS user model: boards appear by being posted to.
 """
 
 import re
@@ -38,18 +52,40 @@ from contextlib import contextmanager
 # bbs.db lives next to this script regardless of the working directory.
 DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bbs.db")
 
-# Board names must be alphanumeric + underscores only.
-# This is critical because table names can't use ? placeholders,
-# so we validate the name before interpolating it into SQL.
-_BOARD_NAME_RE = re.compile(r'^[a-zA-Z0-9_]+$')
+# Board names are user input, so we constrain them: letters, digits,
+# and underscores only.  This no longer matters for SQL safety (board
+# goes through ? placeholders now, not into table names), but it still
+# prevents junk like empty strings or whitespace from becoming a
+# board identity.  Length cap keeps runaway input from wedging the UI.
+_BOARD_NAME_RE = re.compile(r"^[a-zA-Z0-9_]+$")
+_BOARD_MAX_LEN = 32
 
+
+def validate_board(name: str) -> None:
+    """
+    Raise ValueError if `name` is not an acceptable board name.
+
+    Called at the input boundary (before INSERT or WHERE-filter).
+    Silent when the name is fine, so callers can treat it as an
+    assertion-style guard.
+    """
+    if not isinstance(name, str) or not _BOARD_NAME_RE.match(name) or len(name) > _BOARD_MAX_LEN:
+        raise ValueError(
+            f"Invalid board name: {name!r} — use letters, digits, or "
+            f"underscores only (max {_BOARD_MAX_LEN} chars)"
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────
+#  Password hashing (stdlib only — no bcrypt dependency)
+# ──────────────────────────────────────────────────────────────────────
 
 def hash_password(password: str) -> str:
     """
     Return a salted PBKDF2-SHA256 hash as  salt_hex:key_hex.
 
-    Uses 16 random bytes of salt and 100 000 iterations — strong enough
-    for JBBS while staying in the stdlib (no bcrypt dependency).
+    Uses 16 random bytes of salt and 100 000 iterations — strong
+    enough for JBBS while staying in the stdlib.
     """
     salt = os.urandom(16)
     key = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 100_000)
@@ -57,48 +93,18 @@ def hash_password(password: str) -> str:
 
 
 def verify_password(password: str, stored: str) -> bool:
-    """Check a plaintext password against a hash produced by hash_password()."""
+    """Check a plaintext password against a hash from hash_password()."""
     salt_hex, key_hex = stored.split(":")
     salt = bytes.fromhex(salt_hex)
     key = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 100_000)
+    # hmac.compare_digest is a constant-time comparison — resists
+    # timing attacks on the hash check.
     return hmac.compare_digest(key.hex(), key_hex)
 
 
-def board_table(name: str) -> str:
-    """
-    Return the table name for a board (e.g. "tech" → "board_tech").
-
-    Raises ValueError if the name contains unsafe characters.
-    """
-    if not _BOARD_NAME_RE.match(name):
-        raise ValueError(
-            f"Invalid board name: {name!r} — only letters, digits, and underscores allowed"
-        )
-    return f"board_{name}"
-
-
-def create_board(conn, name: str) -> None:
-    """Create a board's table if it doesn't already exist."""
-    table = board_table(name)
-    conn.execute(f"""
-        CREATE TABLE IF NOT EXISTS {table} (
-            id        INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id   INTEGER NOT NULL REFERENCES users(id),
-            message   TEXT    NOT NULL,
-            timestamp TEXT    NOT NULL
-        )
-    """)
-
-
-def get_board_names(conn) -> list[str]:
-    """Return all board names by inspecting sqlite_master."""
-    rows = conn.execute("""
-        SELECT name FROM sqlite_master
-        WHERE type = 'table' AND name LIKE 'board\\_%' ESCAPE '\\'
-        ORDER BY name
-    """).fetchall()
-    return [row[0][6:] for row in rows]   # strip "board_" prefix
-
+# ──────────────────────────────────────────────────────────────────────
+#  Connection & schema
+# ──────────────────────────────────────────────────────────────────────
 
 @contextmanager
 def get_db():
@@ -124,11 +130,12 @@ def get_db():
 
 def init_db() -> None:
     """
-    Create the users table and the default "general" board table.
+    Create the users and posts tables if they don't already exist.
 
-    Safe to call on every startup — uses CREATE TABLE IF NOT EXISTS.
-    If the users table already exists but lacks the password_hash column
-    (pre-Gold schema), ALTER TABLE adds it non-destructively.
+    Safe to call on every startup — CREATE TABLE IF NOT EXISTS is
+    idempotent.  Nothing fancy here: no ALTER TABLE migrations, no
+    schema-version logic.  This is the ONE and ONLY schema the CLI
+    has ever shipped.
     """
     with get_db() as conn:
         conn.execute("""
@@ -138,9 +145,12 @@ def init_db() -> None:
                 password_hash TEXT
             )
         """)
-        # Migrate older databases that lack the password_hash column.
-        columns = [row[1] for row in conn.execute("PRAGMA table_info(users)").fetchall()]
-        if "password_hash" not in columns:
-            conn.execute("ALTER TABLE users ADD COLUMN password_hash TEXT")
-
-        create_board(conn, "general")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS posts (
+                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id   INTEGER NOT NULL REFERENCES users(id),
+                board     TEXT    NOT NULL DEFAULT 'general',
+                message   TEXT    NOT NULL,
+                timestamp TEXT    NOT NULL
+            )
+        """)

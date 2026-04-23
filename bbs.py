@@ -20,48 +20,16 @@ import json
 import os
 from datetime import datetime
 
-# ──────────────────────────────────────────────────────────────────────────────
-#  Terminal color constants  (ANSI 256-color escape codes)
-#
-#  These are zero-width control strings; the terminal interprets them as
-#  color-switch instructions without consuming any visible space.
-#
-#   LIME   → usernames, success feedback, command names in help
-#   PURPLE → timestamps, box borders, labels, error prefixes
-#   WHITE  → message body (legible on dark backgrounds)
-#   DIM    → secondary / decorative text (punctuation, separators)
-# ──────────────────────────────────────────────────────────────────────────────
-LIME   = "\033[38;5;118m"
-PURPLE = "\033[38;5;135m"
-WHITE  = "\033[97m"
-DIM    = "\033[2m"
-RESET  = "\033[0m"
+from bbs_ui import LIME, PURPLE, WHITE, DIM, RESET, make_banner, format_post
 
 # JSON storage file — lives next to this script, not the CWD.
 # Using abspath so the script can be called from any directory.
 BBS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bbs.json")
 
-# ──────────────────────────────────────────────────────────────────────────────
-#  Splash banner  (only shown when bbs.py is run with no arguments)
-#
-#  Box geometry: 2-char indent  +  ║  +  44-char inner  +  ║  =  48 visible chars/row.
-#  ANSI escape codes are zero-width so they never break this alignment.
-#  The '═' * 44 and f"{'':44}" expressions build the borders/padding correctly.
-# ──────────────────────────────────────────────────────────────────────────────
-BANNER = (
-    "\n"
-    f"  {PURPLE}╔{'═' * 52}╗{RESET}\n"
-    f"  {PURPLE}║  {LIME}     ██╗ ██████╗ ██████╗ ███████╗{PURPLE}                 ║{RESET}\n"
-    f"  {PURPLE}║  {LIME}     ██║ ██╔══██╗██╔══██╗██╔════╝{PURPLE}                 ║{RESET}\n"
-    f"  {PURPLE}║  {LIME}     ██║ ██████╔╝██████╔╝███████╗{PURPLE}                 ║{RESET}\n"
-    f"  {PURPLE}║  {LIME}██   ██║ ██╔══██╗██╔══██╗╚════██║{PURPLE}                 ║{RESET}\n"
-    f"  {PURPLE}║  {LIME}╚█████╔╝ ██████╔╝██████╔╝███████║{PURPLE}                 ║{RESET}\n"
-    f"  {PURPLE}║  {LIME} ╚════╝  ╚═════╝ ╚═════╝ ╚══════╝{PURPLE}                 ║{RESET}\n"
-    f"  {PURPLE}║{'':52}║{RESET}\n"
-    f"  {PURPLE}║  {LIME}JACK'S BULLETIN BOARD SYSTEM{PURPLE}  {DIM}//{RESET}  {WHITE}JSON v1.0{RESET}       {PURPLE}║{RESET}\n"
-    f"  {PURPLE}║{'':52}║{RESET}\n"
-    f"  {PURPLE}╚{'═' * 52}╝{RESET}\n"
-)
+# Splash banner tagged for the JSON edition.  make_banner() comes
+# from bbs_ui so bbs_db.py can reuse the same ASCII art with its own
+# version label.
+BANNER = make_banner("JSON v1.0")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -102,23 +70,16 @@ def save_posts(posts: list[dict]) -> None:
 #  Display helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
-def format_post(post: dict) -> str:
+def _format_post_dict(post: dict) -> str:
     """
-    Render a single post record as a colored terminal line.
-
-    Shows a board tag for non-general boards.
+    Thin adapter: JSON posts are dicts, so unpack them into the
+    shared format_post(username, message, timestamp, board) signature.
     """
-    ts = post["timestamp"][:16].replace("T", " ")
-    board = post.get("board", "general")
-    board_tag = ""
-    if board != "general":
-        board_tag = f"{DIM}[{RESET}{PURPLE}{board}{RESET}{DIM}]{RESET} "
-    return (
-        f"  {DIM}[{RESET}{PURPLE}{ts}{RESET}{DIM}]{RESET} "
-        f"{board_tag}"
-        f"{LIME}{post['username']}{RESET}"
-        f"{DIM}:{RESET} "
-        f"{WHITE}{post['message']}{RESET}"
+    return format_post(
+        post["username"],
+        post["message"],
+        post["timestamp"],
+        post.get("board", "general"),
     )
 
 
@@ -175,7 +136,7 @@ def cmd_read(board: str | None = None) -> None:
     label = f" on {PURPLE}{board}{RESET}" if board else ""
     print(f"\n  {DIM}── Posts{label} {'─' * 30}{RESET}")
     for post in posts:
-        print(format_post(post))
+        print(_format_post_dict(post))
     print()
 
 
@@ -244,7 +205,7 @@ def cmd_search(keyword: str) -> None:
 
     print()
     for post in results:
-        print(format_post(post))
+        print(_format_post_dict(post))
     print()
 
 

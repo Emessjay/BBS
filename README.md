@@ -37,7 +37,7 @@ All Part A commands, plus:
 python -m pytest test_bbs.py -v
 ```
 
-31 end-to-end tests covering all three parts. Tests run each program as a subprocess, strip ANSI codes for clean assertions, and clean up generated files automatically.
+32 end-to-end tests covering all three parts. Each test runs the program under test as a subprocess, strips ANSI codes for clean assertions, and is fully self-contained — an autouse fixture wipes `bbs.json`, `bbs.db`, and any backup files before and after every test, so tests can run in any order.
 
 ## Tier
 
@@ -73,9 +73,13 @@ python bbs.py read tech             # read only that board
 python bbs.py boards                # list boards with post counts
 ```
 
-In the JSON version, boards are stored as a `"board"` field on each post object. In the SQLite version, each board gets its own table (`board_general`, `board_tech`, etc.). This means reading a single board is a direct table scan with no filtering — and the `boards` command queries `sqlite_master` to discover all board tables dynamically.
+In both versions, the board is stored as a field on each post. The JSON version keeps it as a `"board"` key on each post object; the SQLite version stores it as a `board TEXT NOT NULL` column on a single `posts` table. That means:
 
-Board names are validated with a regex (`^[a-zA-Z0-9_]+$`) before being interpolated into SQL, since table names can't use parameterized placeholders.
+- `read <board>` is one `WHERE board = ?` query — no table enumeration, no `UNION ALL`.
+- `boards` is one `SELECT board, COUNT(*) FROM posts GROUP BY board` — no scanning `sqlite_master`.
+- "all posts by user X" is a plain `JOIN` instead of N queries across N board tables.
+
+Board names are validated (letters/digits/underscores only, max 32 chars) at the input boundary via `validate_board()`. This is no longer a SQL-injection guard (board values go through `?` placeholders) — it just keeps junk like empty strings or whitespace out of the data.
 
 ## Gold: ASCII Art, Colored Output, and Persistent Logins
 
@@ -85,7 +89,7 @@ Both versions display an ASCII art banner (block-letter "JBBS" using box-drawing
 
 ### User Accounts & Interactive Sessions
 
-The SQLite version adds `register` and `login` commands. Passwords are hashed with PBKDF2-HMAC-SHA256 (100,000 iterations, 16-byte random salt) using only the stdlib — no bcrypt dependency needed. Hashes are stored as `salt_hex:key_hex` in the `password_hash` column of the `users` table.
+The SQLite version adds `register` and `login` commands. Passwords are hashed with PBKDF2-HMAC-SHA256 (100,000 iterations, 16-byte random salt) using only the stdlib — no bcrypt dependency needed. Hashes are stored as `salt_hex:key_hex` in the `password_hash` column of the `users` table. Verification uses `hmac.compare_digest` so the check runs in constant time (no timing side-channel on wrong-password guesses).
 
 Users created via CLI posts (before registering) have a `NULL` password hash. Running `register` with that username lets you "claim" the account by setting a password, so no posts are lost.
 
@@ -100,5 +104,3 @@ jbbs> search Hello
 jbbs> whoami
 jbbs> quit
 ```
-
-This required adding the `password_hash` column to the `users` table. The schema auto-migrates: if an older database lacks the column, `init_db()` adds it with `ALTER TABLE` on startup, so nothing breaks.

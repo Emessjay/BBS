@@ -11,13 +11,14 @@ Edge-case handling
     incoming JSON posts, and everything is re-inserted in chronological
     order so that post IDs always increase with time (ID 1 = earliest).
 
-  - A username→id dictionary is built incrementally as each user is first
-    encountered during insertion.  cursor.lastrowid gives us the auto-
-    generated id immediately — no follow-up SELECT needed.
+  - A username→id dictionary is built incrementally as each user is
+    first encountered during insertion.  cursor.lastrowid gives us
+    the auto-generated id immediately — no follow-up SELECT needed.
 
-  - Running migrate.py twice WILL duplicate the JSON posts (the first run's
-    copies are read back from the DB and merged with the JSON originals).
-    The backup exists so you can recover the previous state if this happens.
+  - Running migrate.py twice WILL duplicate the JSON posts (the first
+    run's copies are read back from the DB and merged with the JSON
+    originals).  The backup exists so you can recover the previous
+    state if this happens.
 
 Usage:
     python migrate.py
@@ -28,25 +29,17 @@ import json
 import shutil
 from datetime import datetime
 
-from db import DB_FILE, get_db, init_db, board_table, create_board, get_board_names
-
-# ──────────────────────────────────────────────────────────────────────────────
-#  Terminal colors  (same palette as bbs.py / bbs_db.py)
-# ──────────────────────────────────────────────────────────────────────────────
-LIME   = "\033[38;5;118m"
-PURPLE = "\033[38;5;135m"
-WHITE  = "\033[97m"
-DIM    = "\033[2m"
-RESET  = "\033[0m"
+from db import DB_FILE, get_db, init_db
+from bbs_ui import LIME, PURPLE, DIM, RESET
 
 # JSON source file (Part A storage)
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 JSON_FILE  = os.path.join(SCRIPT_DIR, "bbs.json")
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────
 #  Helpers
-# ──────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────
 
 def load_json_posts() -> list[dict]:
     """Load posts from bbs.json.  Returns [] if the file doesn't exist."""
@@ -60,35 +53,30 @@ def load_db_posts() -> list[dict]:
     """
     Read every post out of the existing bbs.db as plain dicts.
 
-    Iterates over all board_* tables and JOINs in the username so the
-    returned dicts match bbs.json's format (plus a "board" key).
+    The flat-posts schema turns this into a single JOIN — no table
+    enumeration, no UNION ALL.  Each row becomes a dict in the same
+    shape as the JSON side so merging is a plain list concat.
 
-    Returns [] if the DB doesn't exist or the tables are missing/empty.
+    Returns [] if the DB doesn't exist or the table is empty/missing.
     """
     if not os.path.exists(DB_FILE):
         return []
     try:
         with get_db() as conn:
-            boards = get_board_names(conn)
-            if not boards:
-                return []
-            results = []
-            for b in boards:
-                t = board_table(b)
-                rows = conn.execute(f"""
-                    SELECT u.username, t.message, t.timestamp
-                      FROM {t} t
-                      JOIN users u ON t.user_id = u.id
-                """).fetchall()
-                for r in rows:
-                    results.append({
-                        "username": r[0], "message": r[1],
-                        "timestamp": r[2], "board": b,
-                    })
+            rows = conn.execute(
+                """
+                SELECT u.username, p.message, p.timestamp, p.board
+                  FROM posts p
+                  JOIN users u ON p.user_id = u.id
+                """
+            ).fetchall()
     except Exception:
         return []
 
-    return results
+    return [
+        {"username": r[0], "message": r[1], "timestamp": r[2], "board": r[3]}
+        for r in rows
+    ]
 
 
 def backup_db() -> str:
@@ -101,23 +89,23 @@ def backup_db() -> str:
 
 def wipe_db() -> None:
     """
-    Drop all board tables and the users table, then recreate from scratch.
+    Drop the posts and users tables, then recreate them from scratch.
 
-    Board tables are dropped first because they hold foreign keys into users.
+    posts is dropped first because its user_id foreign key references
+    users — dropping users first with foreign_keys=ON would fail.
     """
     with get_db() as conn:
-        for b in get_board_names(conn):
-            conn.execute(f"DROP TABLE IF EXISTS {board_table(b)}")
+        conn.execute("DROP TABLE IF EXISTS posts")
         conn.execute("DROP TABLE IF EXISTS users")
     init_db()
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────
 #  Main migration logic
-# ──────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    # ── 1. Load JSON posts ───────────────────────────────────────────────
+    # ── 1. Load JSON posts ──────────────────────────────────────────
     json_posts = load_json_posts()
     if not json_posts:
         print(f"  {PURPLE}Nothing to migrate:{RESET} bbs.json is empty or missing.")
@@ -125,23 +113,23 @@ def main() -> None:
 
     print(f"  {DIM}Loaded {RESET}{LIME}{len(json_posts)}{RESET}{DIM} post(s) from bbs.json{RESET}")
 
-    # ── 2. Pull existing DB posts out before we wipe ─────────────────────
+    # ── 2. Pull existing DB posts out before we wipe ────────────────
     db_posts = load_db_posts()
     if db_posts:
         print(f"  {DIM}Found  {RESET}{LIME}{len(db_posts)}{RESET}{DIM} existing post(s) in bbs.db{RESET}")
         backup_path = backup_db()
         print(f"  {DIM}Backed up to {RESET}{PURPLE}{os.path.basename(backup_path)}{RESET}")
 
-    # ── 3. Wipe and recreate tables (resets AUTOINCREMENT to 1) ──────────
+    # ── 3. Wipe and recreate tables (resets AUTOINCREMENT to 1) ─────
     wipe_db()
 
-    # ── 4. Merge all posts and sort by timestamp ─────────────────────────
+    # ── 4. Merge all posts and sort by timestamp ────────────────────
     #    ISO-8601 timestamps ("2026-03-24T14:01:32") sort lexicographically
     #    in the same order as chronologically, so a plain string sort works.
     all_posts = json_posts + db_posts
     all_posts.sort(key=lambda p: p["timestamp"])
 
-    # ── 5. Insert in chronological order ─────────────────────────────────
+    # ── 5. Insert in chronological order ────────────────────────────
     #    Build a username → user_id dict as we go.  When a user appears for
     #    the first time we INSERT them and grab lastrowid; every subsequent
     #    post from that user reuses the cached id.  Zero SELECTs needed.
@@ -150,6 +138,8 @@ def main() -> None:
     with get_db() as conn:
         for post in all_posts:
             username = post["username"]
+            # Legacy bbs.json entries (pre-boards feature) have no
+            # "board" key; default them to "general" to match bbs.py.
             board    = post.get("board", "general")
 
             if username not in user_dict:
@@ -159,14 +149,13 @@ def main() -> None:
                 )
                 user_dict[username] = cursor.lastrowid
 
-            create_board(conn, board)
-            t = board_table(board)
             conn.execute(
-                f"INSERT INTO {t} (user_id, message, timestamp) VALUES (?, ?, ?)",
-                (user_dict[username], post["message"], post["timestamp"]),
+                "INSERT INTO posts (user_id, board, message, timestamp) "
+                "VALUES (?, ?, ?, ?)",
+                (user_dict[username], board, post["message"], post["timestamp"]),
             )
 
-    # ── Done ─────────────────────────────────────────────────────────────
+    # ── Done ────────────────────────────────────────────────────────
     print(
         f"\n  {LIME}Migrated {len(all_posts)} post(s){RESET}"
         f" {DIM}from {len(user_dict)} user(s) into bbs.db{RESET}\n"
