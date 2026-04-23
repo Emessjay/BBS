@@ -1,6 +1,6 @@
 # BBS Webserver — Assignment 2
 
-A FastAPI wrapper that exposes the A1 BBS over HTTP. The database layer is brand new (the A1 CLI keeps its own SQLite file in the repo root, untouched by the API). The webserver has no passwords, no boards (in bronze), and no auto-create-user-on-post — just a clean REST surface over a flat `users` and `posts` schema.
+A FastAPI REST surface over a fresh SQLite schema. The A1 CLI keeps its own database in the repo root, untouched by the API. The webserver has no passwords and no auto-create-user-on-post (both deliberate changes from A1); gold adds a `board` column so posts can live in named topics.
 
 ## How to run
 
@@ -46,7 +46,7 @@ Or from the repo root:
 .venv/bin/python -m pytest webserver/test_api.py -v
 ```
 
-85 in-process tests using FastAPI's `TestClient`. Each test gets a fresh SQLite file in a pytest `tmp_path` (see [conftest.py](conftest.py)) so the suite is order-independent and parallel-safe.
+198 in-process tests (184 `def test_*` functions, expanded by `@pytest.mark.parametrize`) using FastAPI's `TestClient`: ~75 bronze, ~50 silver, ~37 gold, 22 adversarial. Each test gets a fresh SQLite file in a pytest `tmp_path` (see [conftest.py](conftest.py)) so the suite is order-independent and parallel-safe — `pytest-randomly` is installed, so every run shuffles test order and a hidden dependency would break the build immediately.
 
 ### Running the conformance verifier
 
@@ -76,29 +76,33 @@ Bronze (all 8 endpoints + three `STUDENT TODO` stubs) and silver (PATCH, bio/pos
 - `POST /boards/{name}/posts` — convenience creation endpoint (URL determines board).
 - `GET /posts?board=<name>` — additional composable filter, in the same shape as `?username=` and `?q=`.
 
-`verify_api.py` now runs three layered check functions — `run_*_checks` for bronze, silver, and gold — for 86 total checks end-to-end (44 bronze + 22 silver + 20 gold).
+`verify_api.py` now runs three layered check functions — `run_*_checks` for bronze, silver, and gold — for 86 total checks end-to-end against a live server.
 
 ## Design decisions
 
 ### `response_model` on every route
 
-Every handler declares a `response_model=UserOut` or `response_model=list[PostOut]`. FastAPI filters outgoing data against the model's fields before serializing, so stray database columns never leak into responses. The naive alternative — returning `dict(row)` straight from SQLite — would quietly ship `user_id` in every post response. [`main.py:107-125`](main.py#L107-L125) defines the models; [`main.py:149`](main.py#L149) and similar lines attach them to the handlers.
+Every handler declares a `response_model=UserOut` or `response_model=list[PostOut]`. FastAPI filters outgoing data against the model's fields before serializing, so stray database columns never leak into responses. The naive alternative — returning `dict(row)` straight from SQLite — would quietly ship `user_id` in every post response. Models are defined at the top of [main.py](main.py); every route decorator names one.
 
 ### Hard delete, not soft delete
 
-`DELETE /posts/{id}` issues an actual `DELETE FROM posts WHERE id = ?`. A soft-delete column (`deleted_at IS NULL`) would be safer for audit/recovery, but it would also mean threading "exclude deleted rows" through every single read query — search, list, user posts, get-by-id. For a bronze-tier BBS with no audit requirement, hard delete is the right trade: less code, fewer bugs, and the spec says 204 with no body, which matches the "it's gone" semantics exactly.
+`DELETE /posts/{id}` issues an actual `DELETE FROM posts WHERE id = ?`. A soft-delete column (`deleted_at IS NULL`) would be safer for audit/recovery, but it would also mean threading "exclude deleted rows" through every single read query — search, list, user posts, get-by-id. For a BBS with no audit requirement, hard delete is the right trade: less code, fewer bugs, and the spec's "204 with no body" matches the "it's gone" semantics exactly.
 
 ### Raw SQL, not an ORM
 
-SQLAlchemy would add declarative models, sessions, connection pooling, and ~200 lines of boilerplate for a schema with two tables and seven queries. Raw SQL with `?` placeholders is safe against injection (the `sqlite3` driver binds values before they reach the engine), readable, and — importantly — mirrors the teaching from A1 so a student can trace concepts from one assignment to the next. ORMs start earning their keep at 10+ tables and complex relationships; we're nowhere near that.
+SQLAlchemy would add declarative models, sessions, connection pooling, and ~200 lines of boilerplate for a schema with two tables and a handful of queries. Raw SQL with `?` placeholders is safe against injection (the `sqlite3` driver binds values before they reach the engine), readable, and — importantly — mirrors the teaching from A1 so a student can trace concepts from one assignment to the next. ORMs start earning their keep at 10+ tables and complex relationships; we're nowhere near that.
 
 ### `LIKE` wildcards on search are escaped
 
-The obvious implementation of `?q=` is `WHERE message LIKE '%' || ? || '%'`. That looks fine until you notice that SQL `LIKE`'s `%` and `_` are wildcards — so `?q=%` matches every post (effectively a no-op filter) and `?q=50_off` matches unexpected things. The handler escapes `\`, `%`, and `_` in `q` with an `ESCAPE '\'` clause so the search treats user input as a literal substring. Two tests lock this in ([`test_api.py:300-322`](test_api.py#L300-L322)).
+The obvious implementation of `?q=` is `WHERE message LIKE '%' || ? || '%'`. That looks fine until you notice that SQL `LIKE`'s `%` and `_` are wildcards — so `?q=%` matches every post (effectively a no-op filter) and `?q=50_off` matches unexpected things. The handler escapes `\`, `%`, and `_` in `q` with an `ESCAPE '\'` clause so the search treats user input as a literal substring. Dedicated tests in the "Search" and "Adversarial" sections of [test_api.py](test_api.py) lock this in.
 
-### Envelope response for 204 DELETE
+### Explicit empty `Response` from DELETE
 
-Returning `None` from a 204 handler makes FastAPI serialize it as the string `"null"`, which is a one-byte body — and 204 responses are supposed to be bodyless. [`main.py:329`](main.py#L329) returns an explicit `Response(status_code=204)` to sidestep that gotcha. One of the 85 tests asserts `r.content == b""` specifically to catch regressions here.
+Returning `None` from a 204 handler makes FastAPI serialize it as the string `"null"`, which is a one-byte body — and 204 responses are supposed to be bodyless. `delete_post` returns an explicit `Response(status_code=204)` to sidestep that gotcha. Two tests assert `r.content == b""` specifically to catch regressions here.
+
+### Indexes on `posts.user_id` and `posts.board`
+
+SQLite does not auto-index foreign-key columns. `UserOut.post_count` runs a correlated subquery `SELECT COUNT(*) FROM posts WHERE p.user_id = u.id` once per user; without an index it's O(users × posts). `?board=` filter and `GET /boards` group-by have the same shape on `posts.board`. Both indexes are created in `init_db` with `CREATE INDEX IF NOT EXISTS` — invisible at toy scale, load-bearing at any scale worth caring about.
 
 ## Schema changes from A1
 
@@ -205,7 +209,7 @@ Every user response (POST /users, GET /users, GET /users/{username}, PATCH /user
 - **`bio`** — a nullable string (max 200 chars). Null for users who have never set one. Set via `PATCH /users/{username}`.
 - **`post_count`** — an integer, always present. Computed from a correlated subquery `(SELECT COUNT(*) FROM posts WHERE p.user_id = u.id)` on every read, never stored.
 
-The same SELECT fragment ([`main.py:139-146`](main.py#L139-L146)) serves POST, GET one, GET list, and PATCH. Centralizing it means a future schema change only touches one string.
+The same SELECT fragment (`_USER_SELECT` in [main.py](main.py)) serves POST, GET one, GET list, and PATCH. Centralizing it means a future schema change only touches one string.
 
 ### `updated_at` on post responses
 
@@ -242,9 +246,9 @@ Status-code order on `PATCH /posts/{id}` (the order matters):
 | Message body fails validation (empty, >500 chars, explicit null) | 422 |
 | OK | 200 |
 
-The 404-before-403 ordering is the plain-REST default: an unknown post id always looks the same regardless of who is asking. A security-hardened build would flip this to 403-everywhere to avoid confirming whether a given id exists. Silver is not worried about that threat model.
+The 404-before-403 ordering is the plain-REST default: an unknown post id always looks the same regardless of who is asking. A security-hardened build would flip this to 403-everywhere to avoid confirming whether a given id exists. This build is not worried about that threat model.
 
-A subtle Pydantic point: `min_length=1` on an `Optional[str]` field does NOT reject `None` — the constraint only fires when the value is a string. A body of `{"message": null}` would silently pass. The handler catches this explicitly with a `HTTP_422_UNPROCESSABLE_CONTENT` before the DB write ([`main.py:452-457`](main.py#L452-L457)).
+A subtle Pydantic point: `min_length=1` on an `Optional[str]` field does NOT reject `None` — the constraint only fires when the value is a string. A body of `{"message": null}` would silently pass. The handler catches this explicitly by raising `HTTP_422_UNPROCESSABLE_CONTENT` before the DB write; see `update_post` in [main.py](main.py).
 
 ### `GET /posts?username=alice` — filter by author
 
@@ -359,3 +363,31 @@ Roughly 40 gold tests. Non-obvious bugs locked in:
 - **URL path validation mirrors body validation** — `/boards/has spaces/posts` returns 422, not a silent acceptance.
 - **`?board=ghost` returns 200 `[]`**, not 404 — same filter-vs-lookup distinction used for `?username=` in silver. Consistency across the API matters.
 - **All four filters compose at once** — `board`, `username`, `q`, and `limit` in a single test. If any of them drop out of the SQL builder, the test fires immediately.
+
+## Adversarial review pass
+
+After gold was complete, a separate pass read through the code looking for real bugs, not-yet-tested edge cases, and documentation drift. Concrete outcomes:
+
+### Code changes
+
+- **Extracted `_IDENT_RE`** as a module-level constant in [main.py](main.py). The regex `^[a-zA-Z0-9_]+$` was previously written out three times (UserCreate.username, PostCreate.board, and a separate `_BOARD_PATTERN`). One constant now feeds all three call sites, so tightening the character class is a one-line change.
+- **Defensive 404 in `update_post`** — after the UPDATE we re-read the row to build the response. If that re-read ever returns `None` (theoretically possible under a concurrent DELETE in a multi-worker deployment we don't have), a stale `_row_to_post(None)` would crash with a 500. An explicit `if post_row is None: raise HTTPException(404)` converts that into a clean 404 at zero cost.
+- **Indexes on `posts.user_id` and `posts.board`** (see Design decisions above). Added to [db.py](db.py)'s `init_db`.
+- **Docstring truth-up** — main.py's module header said "silver tier" and had a SILVER IN ONE PARAGRAPH section. Rewrote to reflect gold and added a bronze → silver → gold evolution recap. db.py's "Differences from A1" now describes the *current* A1 schema (which also uses flat posts after an earlier refactor round), not the original table-per-board A1. A misleading comment claiming "Pydantic does not validate FastAPI path parameters with the same `Field(pattern=...)` machinery" was corrected — `Path()` uses the same machinery.
+
+### 22 adversarial tests
+
+Added as a clearly-labeled final section in [test_api.py](test_api.py). Each targets a specific failure mode that a reasonable implementation could ship without noticing. Highlights:
+
+- **SQL `LIKE` escape order** — `?q=r"path\to\file"` must match a literal backslash; the escape order must replace `\` before it replaces `%` and `_`.
+- **`?q=""` matches everything** (builds `LIKE '%%'`). Documented so a refactor doesn't accidentally make it return `[]`.
+- **Order-of-checks on PATCH /posts/{id}** — 400 (missing header) beats 422 (null message) beats 404 (missing post) beats 403 (wrong author). Three tests pin the documented order.
+- **Forward-compat: extra body fields are ignored** — three tests confirm that a client sending a future `avatar` field, or trying to inject `updated_at` / `board` / `id`, doesn't corrupt state.
+- **Pydantic type coercion is OFF** — `{"message": 42}` and `{"message": true}` both return 422, not a silent coerce-to-string.
+- **Case sensitivity parity** — `?username=alice` and `?username=Alice` don't cross-match; mirrors the store-time UNIQUE behavior.
+- **Ordering contract on `GET /boards`** — `ORDER BY count DESC, name ASC`. Pinned so a UI that relies on the order survives refactors.
+- **204 body is truly empty** — `r.content == b""` and `Content-Length` is 0 or absent.
+
+### Manual curl smoke test
+
+Twenty `curl -i` commands were run against a live uvicorn instance after the adversarial pass. Every endpoint returned the expected status line, Content-Type, and body shape. `GET /docs` (FastAPI's Swagger UI) and `GET /openapi.json` both work — 13 method-path combinations across 7 distinct path patterns.
