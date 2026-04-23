@@ -129,6 +129,16 @@ def main() -> int:
     # ==================================================================
     run_silver_checks(c, state)
 
+    # ==================================================================
+    # GOLD CHECKS
+    #
+    # run_gold_checks exercises the boards/topics feature: the new
+    # `board` field on posts, the /boards and /boards/{name}/posts
+    # endpoints, POST /boards/{name}/posts, and the ?board= filter
+    # on GET /posts.
+    # ==================================================================
+    run_gold_checks(c, state)
+
     print()
     print(f"{PASSED} passed, {FAILED} failed")
     return 0 if FAILED == 0 else 1
@@ -192,10 +202,10 @@ def run_post_checks(c: httpx.Client, state: dict) -> None:
     check("POST /posts with X-Username returns 201", r.status_code == 201, detail=f"got {r.status_code}")
     if r.status_code == 201:
         body = r.json()
-        # Silver post shape adds updated_at (null until first PATCH).
-        expected_keys = {"id", "username", "message", "created_at", "updated_at"}
+        # Gold post shape: silver's five fields + `board` (default 'general').
+        expected_keys = {"id", "username", "message", "created_at", "updated_at", "board"}
         check(
-            "POST /posts response has exactly id, username, message, created_at, updated_at",
+            "POST /posts response has exactly id, username, message, created_at, updated_at, board",
             set(body.keys()) == expected_keys,
             detail=str(body),
         )
@@ -369,13 +379,10 @@ def run_field_shape_checks(c: httpx.Client, state: dict) -> None:
     # SET-EQUALITY, so an extra field fails just as loudly as a
     # missing one.
 
-    # Silver widens the shapes:
-    #   users gain `bio` (nullable) and `post_count` (computed)
-    #   posts gain `updated_at` (null until first PATCH)
-    # Set-equality still applies — we just compare against the bigger
-    # set.  An extra or missing field fails exactly as before.
+    # Gold widens the post shape again with `board` (default 'general').
+    # User shape is unchanged from silver.
     expected_user = {"username", "created_at", "bio", "post_count"}
-    expected_post = {"id", "username", "message", "created_at", "updated_at"}
+    expected_post = {"id", "username", "message", "created_at", "updated_at", "board"}
 
     # ── User shape: POST, GET one, and items in GET all ───────────
     fresh_user = f"shape_{RUN}"
@@ -562,10 +569,12 @@ def run_silver_checks(c: httpx.Client, state: dict) -> None:
                 r.json().get("updated_at") is not None,
                 detail=str(r.json()),
             )
+            # Historical name (written at silver); we now expect the
+            # current tier's shape (gold adds `board`).
             check(
-                f"PATCH /posts/{pid} response has silver post shape",
+                f"PATCH /posts/{pid} response has current post shape",
                 set(r.json().keys()) == {
-                    "id", "username", "message", "created_at", "updated_at"
+                    "id", "username", "message", "created_at", "updated_at", "board"
                 },
                 detail=str(r.json()),
             )
@@ -635,6 +644,229 @@ def run_silver_checks(c: httpx.Client, state: dict) -> None:
             f"GET /posts?username={GHOST} (unknown) returns empty array",
             r.json() == [],
             detail=str(r.json()),
+        )
+
+
+def run_gold_checks(c: httpx.Client, state: dict) -> None:
+    # Gold adds the boards feature.  Concretely we verify:
+    #   1. Posts carry a `board` field (default 'general').
+    #   2. POST /posts with an explicit board lands on that board.
+    #   3. Invalid board names are 422 (regex: letters/digits/_).
+    #   4. GET /boards returns {name, post_count} items, GROUP BY right.
+    #   5. GET /boards/{name}/posts filters correctly.
+    #   6. POST /boards/{name}/posts is the convenience write path.
+    #   7. GET /posts?board= filter composes with other filters.
+    #
+    # All entities here are prefixed with `gd_` and the run id, so
+    # this function is safe to run against a DB that already has
+    # bronze/silver data in it.
+
+    gd_alice = f"gd_alice_{RUN}"
+    gd_bob   = f"gd_bob_{RUN}"
+    gd_board_a = f"gdboarda_{RUN[:6]}"  # keep under 32 chars
+    gd_board_b = f"gdboardb_{RUN[:6]}"
+
+    c.post("/users", json={"username": gd_alice})
+    c.post("/users", json={"username": gd_bob})
+
+    # ── board field + default ────────────────────────────────────
+    r = c.post("/posts", json={"message": "default board check"},
+               headers={"X-Username": gd_alice})
+    if r.status_code == 201:
+        check(
+            "POST /posts without `board` defaults to 'general'",
+            r.json().get("board") == "general",
+            detail=str(r.json()),
+        )
+        check(
+            "POST /posts response includes a `board` field",
+            "board" in r.json(),
+            detail=str(r.json()),
+        )
+
+    # Explicit board
+    r = c.post("/posts",
+               json={"message": "explicit board check", "board": gd_board_a},
+               headers={"X-Username": gd_alice})
+    if r.status_code == 201:
+        check(
+            f"POST /posts with board={gd_board_a} lands on that board",
+            r.json().get("board") == gd_board_a,
+            detail=str(r.json()),
+        )
+
+    # Invalid board name → 422
+    r = c.post("/posts",
+               json={"message": "bad board", "board": "has spaces"},
+               headers={"X-Username": gd_alice})
+    check(
+        "POST /posts with invalid board name returns 422",
+        r.status_code == 422,
+        detail=f"got {r.status_code}",
+    )
+
+    # Null board → 422 (non-optional str field)
+    r = c.post("/posts",
+               json={"message": "null board", "board": None},
+               headers={"X-Username": gd_alice})
+    check(
+        "POST /posts with board=null returns 422",
+        r.status_code == 422,
+        detail=f"got {r.status_code}",
+    )
+
+    # ── GET /boards ──────────────────────────────────────────────
+    # Seed two more posts on gd_board_a and one on gd_board_b so
+    # counts are asymmetric and therefore meaningful to compare.
+    c.post("/posts",
+           json={"message": "seed a2", "board": gd_board_a},
+           headers={"X-Username": gd_alice})
+    c.post("/posts",
+           json={"message": "seed b1", "board": gd_board_b},
+           headers={"X-Username": gd_alice})
+
+    r = c.get("/boards")
+    check(
+        "GET /boards returns 200",
+        r.status_code == 200,
+        detail=f"got {r.status_code}",
+    )
+    if r.status_code == 200:
+        boards = r.json()
+        check(
+            "GET /boards returns a JSON array",
+            isinstance(boards, list),
+            detail=f"got {type(boards).__name__}",
+        )
+        # Check that each item has exactly {name, post_count}.
+        if boards:
+            item = boards[0]
+            check(
+                "GET /boards items have exactly {name, post_count}",
+                set(item.keys()) == {"name", "post_count"},
+                detail=str(item),
+            )
+
+        # Check counts for our two gold boards.
+        counts = {b.get("name"): b.get("post_count") for b in boards}
+        check(
+            f"GET /boards shows gd_board_a ({gd_board_a}) with count >= 2",
+            counts.get(gd_board_a, 0) >= 2,
+            detail=str(counts),
+        )
+        check(
+            f"GET /boards shows gd_board_b ({gd_board_b}) with count >= 1",
+            counts.get(gd_board_b, 0) >= 1,
+            detail=str(counts),
+        )
+
+    # ── GET /boards/{name}/posts ─────────────────────────────────
+    r = c.get(f"/boards/{gd_board_a}/posts")
+    check(
+        f"GET /boards/{gd_board_a}/posts returns 200",
+        r.status_code == 200,
+        detail=f"got {r.status_code}",
+    )
+    if r.status_code == 200:
+        posts = r.json()
+        check(
+            f"GET /boards/{gd_board_a}/posts returns only that board's posts",
+            posts and all(p.get("board") == gd_board_a for p in posts),
+            detail=str([p.get("board") for p in posts]),
+        )
+
+    # Unknown board — filter semantics: 200 [], not 404.
+    r = c.get(f"/boards/unposted_{RUN[:6]}/posts")
+    check(
+        "GET /boards/<unposted>/posts returns 200",
+        r.status_code == 200,
+        detail=f"got {r.status_code}",
+    )
+    if r.status_code == 200:
+        check(
+            "GET /boards/<unposted>/posts returns []",
+            r.json() == [],
+            detail=str(r.json()),
+        )
+
+    # Malformed board name in URL → 422 (Path regex kicks in).
+    r = c.get("/boards/has spaces/posts")
+    check(
+        "GET /boards/<malformed>/posts returns 422",
+        r.status_code == 422,
+        detail=f"got {r.status_code}",
+    )
+
+    # ── POST /boards/{name}/posts ────────────────────────────────
+    r = c.post(f"/boards/{gd_board_a}/posts",
+               json={"message": "via convenience endpoint"},
+               headers={"X-Username": gd_alice})
+    check(
+        f"POST /boards/{gd_board_a}/posts returns 201",
+        r.status_code == 201,
+        detail=f"got {r.status_code}",
+    )
+    if r.status_code == 201:
+        check(
+            f"POST /boards/{gd_board_a}/posts response has board={gd_board_a}",
+            r.json().get("board") == gd_board_a,
+            detail=str(r.json()),
+        )
+        check(
+            "POST /boards/{name}/posts response has gold post shape",
+            set(r.json().keys()) == {
+                "id", "username", "message", "created_at", "updated_at", "board",
+            },
+            detail=str(r.json()),
+        )
+
+    # Missing X-Username → 400 (same as POST /posts).
+    r = c.post(f"/boards/{gd_board_a}/posts",
+               json={"message": "no identity"})
+    check(
+        "POST /boards/{name}/posts without X-Username returns 400",
+        r.status_code == 400,
+        detail=f"got {r.status_code}",
+    )
+
+    # Unknown user → 404.
+    r = c.post(f"/boards/{gd_board_a}/posts",
+               json={"message": "ghost is here"},
+               headers={"X-Username": GHOST})
+    check(
+        "POST /boards/{name}/posts with unknown user returns 404",
+        r.status_code == 404,
+        detail=f"got {r.status_code}",
+    )
+
+    # ── ?board= filter on GET /posts ─────────────────────────────
+    r = c.get("/posts", params={"board": gd_board_b})
+    if r.status_code == 200:
+        posts = r.json()
+        check(
+            f"GET /posts?board={gd_board_b} returns only that board's posts",
+            posts and all(p.get("board") == gd_board_b for p in posts),
+            detail=str([p.get("board") for p in posts]),
+        )
+
+    # Compose: ?board= + ?username= + ?q=
+    # gd_bob has no posts yet — give him one on gd_board_b so we can
+    # compose filters.
+    c.post("/posts",
+           json={"message": "bob keep", "board": gd_board_b},
+           headers={"X-Username": gd_bob})
+    r = c.get("/posts", params={
+        "board": gd_board_b, "username": gd_bob, "q": "keep",
+    })
+    if r.status_code == 200:
+        posts = r.json()
+        check(
+            "GET /posts?board=...&username=...&q=... composes to intersection",
+            len(posts) == 1
+                and posts[0].get("username") == gd_bob
+                and posts[0].get("board") == gd_board_b
+                and "keep" in posts[0].get("message", ""),
+            detail=str(posts),
         )
 
 

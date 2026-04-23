@@ -37,15 +37,20 @@ import pytest
 # The verifier's STUDENT TODO #3 compares set(body.keys()) against
 # these, and so do we.
 #
-# Silver-tier shapes:
-#   - users  gain  bio (nullable) and post_count (computed)
-#   - posts  gain  updated_at (nullable, set by PATCH /posts/{id})
-# Every existing field-shape test automatically checks these expanded
-# sets because it reads from these constants.  Bronze-only callers
-# would need {"username", "created_at"} / {"id", "username", "message",
-# "created_at"}; we deliberately moved past that here.
+# Tier progression (each row is a superset of the row above):
+#   bronze:  users = {username, created_at}
+#            posts = {id, username, message, created_at}
+#   silver:  users += {bio, post_count}   (bio nullable, post_count computed)
+#            posts += {updated_at}        (nullable; set by PATCH)
+#   gold:    users unchanged
+#            posts += {board}             (NOT NULL, defaults to 'general')
+#
+# The whole point of reading from these two constants is that a tier
+# bump is a one-line change.  Every existing field-shape test now
+# asserts the gold shape automatically.
 USER_FIELDS = {"username", "created_at", "bio", "post_count"}
-POST_FIELDS = {"id", "username", "message", "created_at", "updated_at"}
+POST_FIELDS = {"id", "username", "message", "created_at", "updated_at", "board"}
+BOARD_FIELDS = {"name", "post_count"}
 
 # created_at is documented as ISO-8601 with second precision and no
 # timezone — e.g. "2026-04-13T14:01:32".  A regex is enough to catch
@@ -782,9 +787,12 @@ def test_silver_fresh_post_updated_at_is_null(client, alice):
 
 
 def test_silver_fresh_post_has_five_fields(client, alice):
+    # Originally named "five fields" in silver-era; the test now
+    # checks the current tier's shape (six fields as of gold).  Uses
+    # POST_FIELDS so this assertion stays correct across tier bumps.
     body = client.post("/posts", json={"message": "hi"},
                        headers={"X-Username": "alice"}).json()
-    assert set(body.keys()) == {"id", "username", "message", "created_at", "updated_at"}
+    assert set(body.keys()) == POST_FIELDS
 
 
 def test_silver_get_post_by_id_includes_updated_at(client, alice):
@@ -1076,11 +1084,13 @@ def test_patch_post_empty_body_does_not_set_updated_at(client, alice):
 
 
 def test_patch_post_response_has_silver_shape(client, alice):
+    # "silver_shape" is a historical name — we use the current tier
+    # (gold) constant so this survives further tier bumps.
     pid = client.post("/posts", json={"message": "old"},
                       headers={"X-Username": "alice"}).json()["id"]
     body = client.patch(f"/posts/{pid}", json={"message": "new"},
                         headers={"X-Username": "alice"}).json()
-    assert set(body.keys()) == {"id", "username", "message", "created_at", "updated_at"}
+    assert set(body.keys()) == POST_FIELDS
 
 
 def test_patch_post_preserves_unicode(client, alice):
@@ -1198,3 +1208,402 @@ def test_filter_by_username_plus_q_plus_pagination(client, alice, bob):
     assert len(body) == 2
     assert all(p["username"] == "alice" for p in body)
     assert all("keep" in p["message"] for p in body)
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  GOLD — post shape additions (board field)
+# ══════════════════════════════════════════════════════════════════════
+#
+# Gold widens the post object from five fields to six.  The new field
+# is `board`: a non-null string, default "general", must match
+# ^[a-zA-Z0-9_]+$ and be at most 32 chars.  Everything in this
+# section pins down the DEFAULTING and ROUND-TRIP behavior of that
+# new field — the validation rules are in the next section.
+
+def test_gold_fresh_post_defaults_to_general_board(client, alice):
+    # POST /posts with no "board" key in the body must land on the
+    # "general" board.  This is the contract that keeps every bronze
+    # and silver client working unchanged after the schema bump.
+    body = client.post("/posts", json={"message": "hi"},
+                       headers={"X-Username": "alice"}).json()
+    assert body["board"] == "general"
+
+
+def test_gold_post_accepts_explicit_board(client, alice):
+    # Body {"message": "...", "board": "tech"} → post lives on "tech".
+    # Covers the common case of a client targeting a specific board.
+    body = client.post("/posts", json={"message": "hi", "board": "tech"},
+                       headers={"X-Username": "alice"}).json()
+    assert body["board"] == "tech"
+
+
+def test_gold_post_response_has_six_fields(client, alice):
+    # The shape constant at the top of the file pins this, but a
+    # dedicated test documents the intent and fails loudly if somebody
+    # edits the constant without reading this file.
+    body = client.post("/posts", json={"message": "hi"},
+                       headers={"X-Username": "alice"}).json()
+    assert set(body.keys()) == {
+        "id", "username", "message", "created_at", "updated_at", "board",
+    }
+
+
+def test_gold_get_post_by_id_includes_board(client, alice):
+    # Lookup path must include `board` too — not just the create path.
+    # Guards against a common "I added the field to POST but forgot
+    # the SELECT" regression.
+    pid = client.post("/posts", json={"message": "hi", "board": "tech"},
+                      headers={"X-Username": "alice"}).json()["id"]
+    body = client.get(f"/posts/{pid}").json()
+    assert body["board"] == "tech"
+
+
+def test_gold_list_posts_items_include_board(client, alice):
+    # And the list path.  Same regression class.
+    client.post("/posts", json={"message": "a", "board": "tech"},
+                headers={"X-Username": "alice"})
+    for item in client.get("/posts").json():
+        assert "board" in item
+
+
+def test_gold_user_posts_items_include_board(client, alice):
+    client.post("/posts", json={"message": "a", "board": "tech"},
+                headers={"X-Username": "alice"})
+    for item in client.get("/users/alice/posts").json():
+        assert "board" in item
+
+
+def test_gold_patch_preserves_board(client, alice):
+    # PATCH edits the message — it does NOT touch the board column.
+    # A sloppy UPDATE that SETs every column would blank this out.
+    pid = client.post("/posts", json={"message": "old", "board": "tech"},
+                      headers={"X-Username": "alice"}).json()["id"]
+    client.patch(f"/posts/{pid}", json={"message": "new"},
+                 headers={"X-Username": "alice"})
+    assert client.get(f"/posts/{pid}").json()["board"] == "tech"
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  GOLD — board-name validation on POST /posts
+# ══════════════════════════════════════════════════════════════════════
+
+def test_gold_post_board_at_max_length_passes(client, alice):
+    # Boundary: exactly 32 chars passes.
+    r = client.post("/posts", json={"message": "x", "board": "a" * 32},
+                    headers={"X-Username": "alice"})
+    assert r.status_code == 201
+
+
+def test_gold_post_board_too_long_returns_422(client, alice):
+    # One over the cap.
+    r = client.post("/posts", json={"message": "x", "board": "a" * 33},
+                    headers={"X-Username": "alice"})
+    assert r.status_code == 422
+
+
+def test_gold_post_board_empty_string_returns_422(client, alice):
+    # "" doesn't match the regex (needs at least one char), so 422.
+    r = client.post("/posts", json={"message": "x", "board": ""},
+                    headers={"X-Username": "alice"})
+    assert r.status_code == 422
+
+
+@pytest.mark.parametrize("bad", ["has spaces", "with-dash", "with.dot", "wíth unicode", "#hash"])
+def test_gold_post_board_invalid_chars_return_422(client, alice, bad):
+    # The regex is ^[a-zA-Z0-9_]+$, so all of these fail.  Parametrize
+    # so a single test name covers several shapes of input.
+    r = client.post("/posts", json={"message": "x", "board": bad},
+                    headers={"X-Username": "alice"})
+    assert r.status_code == 422, f"{bad!r} was accepted"
+
+
+def test_gold_post_board_null_returns_422(client, alice):
+    # Unlike silver's `bio`, `board` is a non-optional string.
+    # Explicit null is a type error — 422 from Pydantic.
+    r = client.post("/posts", json={"message": "x", "board": None},
+                    headers={"X-Username": "alice"})
+    assert r.status_code == 422
+
+
+def test_gold_post_board_underscore_allowed(client, alice):
+    # Underscores are in the regex.  A dedicated pass-case test so
+    # a tightening of the regex doesn't silently break existing users.
+    r = client.post("/posts", json={"message": "x", "board": "my_board"},
+                    headers={"X-Username": "alice"})
+    assert r.status_code == 201
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  GOLD — GET /boards
+# ══════════════════════════════════════════════════════════════════════
+#
+# Implicit-boards model: a board exists exactly when at least one
+# post references it.  GET /boards returns the set of boards that
+# currently have posts, with counts.  No separate registry; no way
+# to reserve an empty board.  If an empty-board registry is ever
+# needed, that's a separate feature.
+
+def test_gold_get_boards_empty_returns_empty_array(client):
+    # Fresh DB, no posts → no boards.  [] (not null, not 404).
+    r = client.get("/boards")
+    assert r.status_code == 200
+    assert r.json() == []
+
+
+def test_gold_get_boards_is_bare_array(client, alice):
+    # Same "no envelope objects" discipline as the bronze list
+    # endpoints — consistency across the API matters.
+    client.post("/posts", json={"message": "x"}, headers={"X-Username": "alice"})
+    body = client.get("/boards").json()
+    assert isinstance(body, list)
+
+
+def test_gold_get_boards_items_have_shape_name_post_count(client, alice):
+    # Each item is {name, post_count}.  Kept small on purpose —
+    # adding created_at, description, etc. later would be trivial.
+    client.post("/posts", json={"message": "x"}, headers={"X-Username": "alice"})
+    item = client.get("/boards").json()[0]
+    assert set(item.keys()) == {"name", "post_count"}
+
+
+def test_gold_get_boards_includes_post_counts(client, alice):
+    # Two boards with different counts — the GROUP BY must be right.
+    for _ in range(3):
+        client.post("/posts", json={"message": "x", "board": "tech"},
+                    headers={"X-Username": "alice"})
+    client.post("/posts", json={"message": "y", "board": "music"},
+                headers={"X-Username": "alice"})
+    body = client.get("/boards").json()
+    counts = {b["name"]: b["post_count"] for b in body}
+    assert counts == {"tech": 3, "music": 1}
+
+
+def test_gold_get_boards_only_lists_boards_with_posts(client, alice):
+    # Implicit-boards semantics: a board only shows up when posted to.
+    # POSTing to "tech" should not make "music" appear.
+    client.post("/posts", json={"message": "x", "board": "tech"},
+                headers={"X-Username": "alice"})
+    names = [b["name"] for b in client.get("/boards").json()]
+    assert names == ["tech"]
+
+
+def test_gold_get_boards_reflects_deletes(client, alice):
+    # Deleting the last post in a board makes that board disappear
+    # from GET /boards.  No row → no group → no item.  Mirrors how
+    # post_count works on users.
+    pid = client.post("/posts", json={"message": "only", "board": "tech"},
+                      headers={"X-Username": "alice"}).json()["id"]
+    assert any(b["name"] == "tech" for b in client.get("/boards").json())
+    client.delete(f"/posts/{pid}")
+    assert not any(b["name"] == "tech" for b in client.get("/boards").json())
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  GOLD — GET /boards/{name}/posts
+# ══════════════════════════════════════════════════════════════════════
+
+def test_gold_get_board_posts_returns_only_that_boards_posts(client, alice):
+    # Filter discipline: posts on "tech" + posts on "music" →
+    # /boards/tech/posts returns only the tech ones.  Off-by-board
+    # bugs (forgetting the WHERE) show up here.
+    client.post("/posts", json={"message": "t1", "board": "tech"},
+                headers={"X-Username": "alice"})
+    client.post("/posts", json={"message": "t2", "board": "tech"},
+                headers={"X-Username": "alice"})
+    client.post("/posts", json={"message": "m1", "board": "music"},
+                headers={"X-Username": "alice"})
+    body = client.get("/boards/tech/posts").json()
+    assert len(body) == 2
+    assert all(p["board"] == "tech" for p in body)
+
+
+def test_gold_get_board_posts_empty_for_unposted_board(client):
+    # Under implicit-boards, an un-posted board simply has no rows.
+    # Convention choice: 200 [] rather than 404.  Reasoning: the
+    # endpoint is a FILTER over posts, not a LOOKUP of a board
+    # resource (which does not exist as a table row to "miss").
+    r = client.get("/boards/nonexistent/posts")
+    assert r.status_code == 200
+    assert r.json() == []
+
+
+def test_gold_get_board_posts_items_have_full_post_shape(client, alice):
+    # Must return the same 6-field gold post object as everything else
+    # in /posts-land.  Regressions here usually come from a custom
+    # response_model on this endpoint forgetting a field.
+    client.post("/posts", json={"message": "t1", "board": "tech"},
+                headers={"X-Username": "alice"})
+    item = client.get("/boards/tech/posts").json()[0]
+    assert set(item.keys()) == {
+        "id", "username", "message", "created_at", "updated_at", "board",
+    }
+
+
+def test_gold_get_board_posts_does_not_include_other_boards(client, alice):
+    # A second form of the "only that board" test but phrased as
+    # "messages from the other board must NOT appear" — useful for
+    # catching a WHERE clause that uses OR instead of AND.
+    client.post("/posts", json={"message": "tech-only", "board": "tech"},
+                headers={"X-Username": "alice"})
+    client.post("/posts", json={"message": "music-only", "board": "music"},
+                headers={"X-Username": "alice"})
+    messages = [p["message"] for p in client.get("/boards/tech/posts").json()]
+    assert "tech-only" in messages
+    assert "music-only" not in messages
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  GOLD — POST /boards/{name}/posts  (convenience creation endpoint)
+# ══════════════════════════════════════════════════════════════════════
+#
+# POST /boards/tech/posts with body {"message": "hi"} is equivalent
+# to POST /posts with body {"message": "hi", "board": "tech"}.
+# The URL wins — the body does not accept a "board" field here
+# (we simply don't define it on the Pydantic model for this endpoint).
+
+def test_gold_post_to_board_returns_201(client, alice):
+    r = client.post("/boards/tech/posts", json={"message": "hi"},
+                    headers={"X-Username": "alice"})
+    assert r.status_code == 201
+
+
+def test_gold_post_to_board_sets_board_from_url(client, alice):
+    # The URL parameter should be what ends up on the row.
+    body = client.post("/boards/tech/posts", json={"message": "hi"},
+                       headers={"X-Username": "alice"}).json()
+    assert body["board"] == "tech"
+
+
+def test_gold_post_to_board_response_shape(client, alice):
+    body = client.post("/boards/tech/posts", json={"message": "hi"},
+                       headers={"X-Username": "alice"}).json()
+    assert set(body.keys()) == {
+        "id", "username", "message", "created_at", "updated_at", "board",
+    }
+
+
+def test_gold_post_to_board_missing_x_username_returns_400(client, alice):
+    # Same X-Username contract as POST /posts.  This endpoint is a
+    # wrapper; the auth semantics must be identical, or we'd end up
+    # with two subtly different doors into the same write.
+    r = client.post("/boards/tech/posts", json={"message": "hi"})
+    assert r.status_code == 400
+
+
+def test_gold_post_to_board_unknown_user_returns_404(client):
+    r = client.post("/boards/tech/posts", json={"message": "hi"},
+                    headers={"X-Username": "ghost"})
+    assert r.status_code == 404
+
+
+def test_gold_post_to_board_invalid_board_returns_422(client, alice):
+    # URL path {name} must obey the same regex as the body `board`.
+    # A user-supplied path param that fails validation → 422.
+    r = client.post("/boards/has spaces/posts", json={"message": "hi"},
+                    headers={"X-Username": "alice"})
+    # httpx/TestClient URL-encodes the space — but the server still
+    # sees "has spaces" after decoding, and it still fails validation.
+    assert r.status_code == 422
+
+
+def test_gold_post_to_board_appears_in_board_listing(client, alice):
+    # End-to-end: POST via the convenience endpoint must become
+    # visible through the board listing.  Catches a mistake where
+    # the two paths write to different storage.
+    client.post("/boards/tech/posts", json={"message": "hi"},
+                headers={"X-Username": "alice"})
+    assert any(b["name"] == "tech" for b in client.get("/boards").json())
+
+
+def test_gold_post_to_board_body_message_required(client, alice):
+    # Body is still {"message": str}.  Omitting message → 422.
+    r = client.post("/boards/tech/posts", json={},
+                    headers={"X-Username": "alice"})
+    assert r.status_code == 422
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  GOLD — GET /posts?board=X  (filter, composes with everything else)
+# ══════════════════════════════════════════════════════════════════════
+
+def test_gold_filter_by_board(client, alice):
+    client.post("/posts", json={"message": "t", "board": "tech"},
+                headers={"X-Username": "alice"})
+    client.post("/posts", json={"message": "m", "board": "music"},
+                headers={"X-Username": "alice"})
+    body = client.get("/posts", params={"board": "tech"}).json()
+    assert len(body) == 1
+    assert body[0]["board"] == "tech"
+
+
+def test_gold_filter_by_unknown_board_returns_empty_array(client, alice):
+    # Same filter-vs-lookup distinction as ?username=.  Unknown →
+    # empty result, not an error.
+    client.post("/posts", json={"message": "x"}, headers={"X-Username": "alice"})
+    r = client.get("/posts", params={"board": "ghost"})
+    assert r.status_code == 200
+    assert r.json() == []
+
+
+def test_gold_filter_by_board_composes_with_q(client, alice):
+    # Intersection: tech board AND message contains "keep".
+    client.post("/posts", json={"message": "keep me", "board": "tech"},
+                headers={"X-Username": "alice"})
+    client.post("/posts", json={"message": "drop me", "board": "tech"},
+                headers={"X-Username": "alice"})
+    client.post("/posts", json={"message": "keep me", "board": "music"},
+                headers={"X-Username": "alice"})
+    body = client.get("/posts", params={"board": "tech", "q": "keep"}).json()
+    assert len(body) == 1
+    assert body[0]["message"] == "keep me"
+    assert body[0]["board"] == "tech"
+
+
+def test_gold_filter_by_board_composes_with_username(client, alice, bob):
+    # Board + username.  Both filter to alice's tech posts.
+    client.post("/posts", json={"message": "a-t", "board": "tech"},
+                headers={"X-Username": "alice"})
+    client.post("/posts", json={"message": "b-t", "board": "tech"},
+                headers={"X-Username": "bob"})
+    client.post("/posts", json={"message": "a-m", "board": "music"},
+                headers={"X-Username": "alice"})
+    body = client.get("/posts",
+                      params={"board": "tech", "username": "alice"}).json()
+    assert len(body) == 1
+    assert body[0]["message"] == "a-t"
+
+
+def test_gold_filter_by_board_composes_with_pagination(client, alice):
+    # Five tech posts, limit 2 → 2 tech posts.  Pagination applies
+    # to the FILTERED result (not the raw posts table).
+    for i in range(5):
+        client.post("/posts", json={"message": f"t{i}", "board": "tech"},
+                    headers={"X-Username": "alice"})
+    for i in range(5):
+        client.post("/posts", json={"message": f"m{i}", "board": "music"},
+                    headers={"X-Username": "alice"})
+    body = client.get("/posts", params={"board": "tech", "limit": 2}).json()
+    assert len(body) == 2
+    assert all(p["board"] == "tech" for p in body)
+
+
+def test_gold_all_four_filters_compose(client, alice, bob):
+    # The whole stack at once: board + username + q + limit.  If any
+    # of them drop out of the SQL builder, this test catches it.
+    for i in range(3):
+        client.post("/posts", json={"message": f"keep {i}", "board": "tech"},
+                    headers={"X-Username": "alice"})
+    client.post("/posts", json={"message": "drop", "board": "tech"},
+                headers={"X-Username": "alice"})
+    client.post("/posts", json={"message": "keep 0", "board": "music"},
+                headers={"X-Username": "alice"})
+    client.post("/posts", json={"message": "keep 0", "board": "tech"},
+                headers={"X-Username": "bob"})
+    body = client.get("/posts", params={
+        "board": "tech", "username": "alice", "q": "keep", "limit": 2,
+    }).json()
+    assert len(body) == 2
+    for p in body:
+        assert p["board"] == "tech"
+        assert p["username"] == "alice"
+        assert "keep" in p["message"]

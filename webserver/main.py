@@ -53,7 +53,7 @@ from datetime import datetime, timezone
 from typing import Optional
 import sqlite3
 
-from fastapi import FastAPI, HTTPException, Header, Query, Response, status
+from fastapi import FastAPI, HTTPException, Header, Path, Query, Response, status
 from pydantic import BaseModel, Field
 
 from db import get_db, init_db
@@ -94,7 +94,36 @@ class UserCreate(BaseModel):
 
 
 class PostCreate(BaseModel):
-    """Body for POST /posts."""
+    """
+    Body for POST /posts.
+
+    `board` is gold:
+      - Field(default="general", ...) makes it OPTIONAL for the client
+        (an omitted field gets the default).
+      - The type is `str` (not Optional[str]) so a literal `null` in
+        the JSON body is a type error → 422.
+      - pattern + max_length = the same regex the A1 CLI uses for
+        board names: letters/digits/underscores, up to 32 chars.
+    This three-way behavior (omit → default, valid → used, null → 422)
+    is exactly what the gold tests lock in.
+    """
+    message: str = Field(..., min_length=1, max_length=500)
+    board: str = Field(default="general",
+                       pattern=r"^[a-zA-Z0-9_]+$",
+                       max_length=32)
+
+
+class BoardPostCreate(BaseModel):
+    """
+    Body for POST /boards/{name}/posts.
+
+    Deliberately does NOT accept a `board` field.  The URL is the
+    authoritative board identity; allowing a body.board would let
+    a client send /boards/tech/posts with {"board": "music"} and
+    force the server into a conflict-resolution decision we do not
+    want to make.  Simpler: the URL wins because it is the only
+    place the board can be named.
+    """
     message: str = Field(..., min_length=1, max_length=500)
 
 
@@ -149,14 +178,33 @@ class UserOut(BaseModel):
 
 class PostOut(BaseModel):
     """
-    Silver post response.  Exactly five fields.  updated_at is null
-    for posts that have never been PATCHed.
+    Gold post response.  Exactly six fields.
+
+      - updated_at is null for posts that have never been PATCHed (silver)
+      - board always present; defaults to 'general' (gold)
     """
     id: int
     username: str
     message: str
     created_at: str
     updated_at: Optional[str] = None
+    board: str
+
+
+class BoardOut(BaseModel):
+    """
+    Gold board response item.  Two fields, both computed:
+      - name:       the board identifier (a distinct value from posts.board)
+      - post_count: how many posts currently live on that board
+
+    There is no `created_at` because there is no `boards` table to
+    have been created in.  A board's only existence proof is its
+    posts.  When the last post on a board is deleted, the board
+    itself disappears from GET /boards — that behavior is pinned by
+    test_gold_get_boards_reflects_deletes.
+    """
+    name: str
+    post_count: int
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -180,7 +228,8 @@ SELECT p.id,
        u.username,
        p.message,
        p.created_at,
-       p.updated_at
+       p.updated_at,
+       p.board
   FROM posts p
   JOIN users u ON u.id = p.user_id
 """
@@ -218,6 +267,7 @@ def _row_to_post(row: sqlite3.Row) -> dict:
         "message":    row["message"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
+        "board":      row["board"],
     }
 
 
@@ -230,11 +280,58 @@ def _fetch_user(conn, username: str):
 
 
 def _fetch_post(conn, post_id: int):
-    """Load one post in full silver shape, or None if missing."""
+    """Load one post in full gold shape, or None if missing."""
     return conn.execute(
         _POST_SELECT + " WHERE p.id = ?",
         (post_id,),
     ).fetchone()
+
+
+def _insert_post(x_username: Optional[str], message: str, board: str) -> dict:
+    """
+    Shared write path for POST /posts and POST /boards/{name}/posts.
+
+    Centralising the actual INSERT here means the two public
+    endpoints cannot drift apart on:
+      - the X-Username header contract (missing → 400, unknown → 404)
+      - the response shape
+      - the default timestamp rules
+
+    Both callers are responsible for having already validated the
+    `board` value against the regex (Pydantic does that on their
+    respective body/path models before we get here).
+    """
+    if not x_username:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="X-Username header is required",
+        )
+
+    created_at = _now_iso()
+    with get_db() as conn:
+        user_row = conn.execute(
+            "SELECT id FROM users WHERE username = ?", (x_username,)
+        ).fetchone()
+        if user_row is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"user '{x_username}' not found",
+            )
+        cursor = conn.execute(
+            "INSERT INTO posts (user_id, message, created_at, board) "
+            "VALUES (?, ?, ?, ?)",
+            (user_row["id"], message, created_at, board),
+        )
+        new_id = cursor.lastrowid
+
+    return {
+        "id": new_id,
+        "username": x_username,
+        "message": message,
+        "created_at": created_at,
+        "updated_at": None,
+        "board": board,
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -373,35 +470,11 @@ def create_post(
     422 — message validation fails (Pydantic)
     201 — OK; response updated_at is null (nothing's been edited yet)
     """
-    if not x_username:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="X-Username header is required",
-        )
-
-    created_at = _now_iso()
-    with get_db() as conn:
-        user_row = conn.execute(
-            "SELECT id FROM users WHERE username = ?", (x_username,)
-        ).fetchone()
-        if user_row is None:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"user '{x_username}' not found",
-            )
-        cursor = conn.execute(
-            "INSERT INTO posts (user_id, message, created_at) VALUES (?, ?, ?)",
-            (user_row["id"], body.message, created_at),
-        )
-        new_id = cursor.lastrowid
-
-    return {
-        "id": new_id,
-        "username": x_username,
-        "message": body.message,
-        "created_at": created_at,
-        "updated_at": None,
-    }
+    # All the work is in _insert_post: header/user validation,
+    # the INSERT, and the hand-built response.  This handler is now
+    # essentially an arg-unpacking shim so /posts and
+    # /boards/{name}/posts share one write path.
+    return _insert_post(x_username, body.message, body.board)
 
 
 @app.get("/posts", response_model=list[PostOut])
@@ -416,10 +489,14 @@ def list_posts(
     # [] (no matches)", not "422 because your filter string has a
     # dash".  Cleaner to let any string flow through.
     username: Optional[str] = Query(default=None),
+    # Gold: filter by board.  Same permissive reasoning as username —
+    # an unknown or malformed filter string is NOT an error; it is a
+    # filter with zero matches.  The tests pin this explicitly.
+    board: Optional[str] = Query(default=None),
 ):
     """
     List posts, newest first, with optional substring search and
-    optional author filter.
+    optional author/board filters.
 
     ?q=foo         — message contains "foo" (literal, LIKE wildcards
                      escaped; case-insensitive via SQLite's default
@@ -427,12 +504,15 @@ def list_posts(
     ?username=X    — posts by author X only (silver).  Unknown or
                      malformed X → [].  Composes with all other
                      filters (intersection).
+    ?board=Y       — posts on board Y only (gold).  Same filter
+                     semantics as ?username=.
     ?limit=N       — cap results at N (1-200, default 50).
     ?offset=K      — skip first K (>= 0, default 0).
     """
     # Build the query out of a base SELECT + an AND-joined list of
     # WHERE clauses.  Keeping params in lock-step with the clauses
-    # makes it easy to add more filters later (gold tier: ?board=).
+    # is what makes adding a new filter cheap — each new filter is
+    # just one `if` block that appends to both lists.
     sql = _POST_SELECT
     where: list[str] = []
     params: list = []
@@ -451,6 +531,10 @@ def list_posts(
         # with how usernames are stored and compared everywhere else.
         where.append("u.username = ?")
         params.append(username)
+
+    if board is not None:
+        where.append("p.board = ?")
+        params.append(board)
 
     if where:
         sql += " WHERE " + " AND ".join(where)
@@ -545,6 +629,85 @@ def update_post(
 
         post_row = _fetch_post(conn, post_id)
     return _row_to_post(post_row)
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  /boards  (gold)
+# ══════════════════════════════════════════════════════════════════════
+#
+# Boards are IMPLICIT: a board exists exactly when at least one post
+# references it.  No separate `boards` table, no `created_at` for
+# boards, no way to reserve an empty board.  Querying /boards/foo/posts
+# when "foo" has never been posted to returns 200 [] — same FILTER
+# semantics we used for ?username= in silver.
+
+# Pydantic does not validate FastAPI path parameters with the same
+# Field(pattern=...) machinery it uses for body fields, so we pass
+# the regex directly to Path().  The effect is the same: a malformed
+# {name} in the URL → 422 from the validation layer, before any
+# handler code runs.
+_BOARD_PATTERN = r"^[a-zA-Z0-9_]+$"
+
+
+@app.get("/boards", response_model=list[BoardOut])
+def list_boards():
+    """
+    List every board that currently has at least one post, with
+    per-board post counts.
+
+    One GROUP BY query, no second table, no bookkeeping.  The sort
+    order is "busiest first, alphabetical tiebreak" — deterministic,
+    and the common thing a UI wants to show.
+    """
+    with get_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT board AS name, COUNT(*) AS post_count
+              FROM posts
+             GROUP BY board
+             ORDER BY post_count DESC, name ASC
+            """
+        ).fetchall()
+    return [{"name": r["name"], "post_count": r["post_count"]} for r in rows]
+
+
+@app.get("/boards/{name}/posts", response_model=list[PostOut])
+def list_board_posts(
+    name: str = Path(..., pattern=_BOARD_PATTERN, max_length=32),
+):
+    """
+    List posts on a single board, in the same DESC-id order as
+    GET /posts.  Never 404s: an unknown board returns [] because
+    boards are not lookup resources — they are filter targets.
+    """
+    with get_db() as conn:
+        rows = conn.execute(
+            _POST_SELECT + " WHERE p.board = ? ORDER BY p.id DESC",
+            (name,),
+        ).fetchall()
+    return [_row_to_post(r) for r in rows]
+
+
+@app.post("/boards/{name}/posts",
+          status_code=status.HTTP_201_CREATED,
+          response_model=PostOut)
+def create_board_post(
+    body: BoardPostCreate,
+    name: str = Path(..., pattern=_BOARD_PATTERN, max_length=32),
+    x_username: Optional[str] = Header(default=None, alias="X-Username"),
+):
+    """
+    Convenience creation endpoint.  Equivalent to:
+        POST /posts  body={"message": ..., "board": <name>}
+
+    The URL's {name} is authoritative; BoardPostCreate deliberately
+    does NOT accept a `board` key in the body, so there is never a
+    conflict to resolve.
+    """
+    # _insert_post handles the X-Username dance and the INSERT.  The
+    # board name has already been validated by the Path() constraint
+    # above, so we can pass it straight through.
+    return _insert_post(x_username, body.message, name)
 
 
 @app.delete("/posts/{post_id}", status_code=status.HTTP_204_NO_CONTENT)

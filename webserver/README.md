@@ -66,17 +66,17 @@ The script prints `PASS`/`FAIL` per check and exits non-zero if anything failed.
 
 ## Tier targeted
 
-**Silver.**
+**Gold.**
 
-Bronze is complete (all 8 endpoints, the three `STUDENT TODO` stubs filled in and their calls un-commented in `verify_api.py::main`). Silver extends it with:
+Bronze (all 8 endpoints + three `STUDENT TODO` stubs) and silver (PATCH, bio/post_count, updated_at, `?username=` filter) are both complete. Gold adds the **boards/topics** feature:
 
-- `bio` and `post_count` on all user responses
-- `updated_at` on all post responses
-- `PATCH /users/{username}` to edit bio
-- `PATCH /posts/{id}` to edit message text, with an ownership policy
-- `GET /posts?username=<name>` to filter posts by author
+- Posts gain a `board` field (default `"general"`).
+- `GET /boards` — list every board with a post count.
+- `GET /boards/{name}/posts` — list posts on a specific board.
+- `POST /boards/{name}/posts` — convenience creation endpoint (URL determines board).
+- `GET /posts?board=<name>` — additional composable filter, in the same shape as `?username=` and `?q=`.
 
-`verify_api.py` grows a `run_silver_checks` function that exercises every silver feature end-to-end against a live server — 64 total checks, up from bronze's 44.
+`verify_api.py` now runs three layered check functions — `run_*_checks` for bronze, silver, and gold — for 86 total checks end-to-end (44 bronze + 22 silver + 20 gold).
 
 ## Design decisions
 
@@ -120,14 +120,14 @@ CREATE TABLE posts (
 );
 ```
 
-A2's schema (silver) is:
+A2's schema (gold) is:
 
 ```sql
 CREATE TABLE users (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     username    TEXT    NOT NULL UNIQUE,
     created_at  TEXT    NOT NULL,
-    bio         TEXT              -- silver, nullable
+    bio         TEXT                                       -- silver, nullable
 );
 
 CREATE TABLE posts (
@@ -135,18 +135,19 @@ CREATE TABLE posts (
     user_id     INTEGER NOT NULL REFERENCES users(id),
     message     TEXT    NOT NULL,
     created_at  TEXT    NOT NULL,
-    updated_at  TEXT              -- silver, nullable
+    updated_at  TEXT,                                      -- silver, nullable
+    board       TEXT    NOT NULL DEFAULT 'general'         -- gold
 );
 ```
 
 Concrete differences from A1:
 
 - **Dropped `password_hash`** from users. The API has no notion of passwords — `X-Username` is the (non-)authentication mechanism, and real auth is out of scope.
-- **Dropped `board`** from posts. Boards are a gold-tier feature per the spec; bronze/silver assume a single global stream.
 - **Renamed `timestamp` → `created_at`** on posts to match the JSON field the spec requires in responses. Keeping them aligned saves a row → dict translation step.
 - **Added `created_at`** to users so `UserOut` can report it without another table lookup.
 - **Removed auto-create-user-on-post.** A1 used `INSERT OR IGNORE` on the users table when posting, silently creating unknown users. A2 treats this as an error: `POST /posts` with an unknown `X-Username` returns 404. This is a real behavior change, called out in the spec.
-- **Silver: added `bio` to users and `updated_at` to posts.** Both nullable, both set by their respective `PATCH` handlers. Note that `post_count` is NOT a column — it is computed per-request from a correlated subquery on the posts table. Storing a counter would require keeping it in sync on every post INSERT/DELETE, and drift bugs are common; computing it sidesteps the problem entirely for a sub-millisecond cost at this scale.
+- **Silver: added `bio` to users and `updated_at` to posts.** Both nullable, both set by their respective `PATCH` handlers. `post_count` is NOT a column — it is computed per-request from a correlated subquery on the posts table. Storing a counter would require keeping it in sync on every post INSERT/DELETE, and drift bugs are common; computing it sidesteps the problem entirely for a sub-millisecond cost at this scale.
+- **Gold: added `board` to posts.** `NOT NULL DEFAULT 'general'` — the default lives in the database (belt-and-suspenders with Pydantic's `default="general"`), so any INSERT path that omits the column still succeeds. Boards have no separate table; they exist implicitly as distinct values in `posts.board`.
 
 ## What I added to verify_api.py
 
@@ -284,3 +285,77 @@ On top of what `verify_api.py` checks, `test_api.py` adds ~50 silver-specific te
 - **Empty-body PATCH does not set `updated_at`** — no-op must not lie about resource history.
 - **404 beats 403** for a nonexistent post with a wrong-author header.
 - **`?username=` filter composes with `?q=` AND `?limit=` AND `?offset=`** — all three in one test, confirming the WHERE / LIMIT / OFFSET apply in the right order.
+
+## Gold additions — Boards / topics
+
+### The feature
+
+Every post now belongs to a named board. Boards exist **implicitly**: a board is real if and only if at least one post references it. There is no `boards` table, no `POST /boards`, no way to reserve an empty board. Adding an empty-board registry is straightforward if it's ever needed (add a `boards` table, `UNION` its rows into `GET /boards`), but the spec doesn't require it and the minimal design pays off in less surface area to test and reason about.
+
+### Three new endpoints + one new filter
+
+| Endpoint | Method | Purpose |
+|---|---|---|
+| `/boards` | GET | List every board with at least one post, with post counts. |
+| `/boards/{name}/posts` | GET | Posts on one board (empty array for never-posted-to boards — filter semantics, not lookup). |
+| `/boards/{name}/posts` | POST | Convenience creation — URL determines the board; body only carries `{"message": "..."}`. |
+| `/posts?board=<name>` | GET | Additional composable filter on the existing list endpoint. |
+
+### Why implicit boards (design decision)
+
+- **Simpler schema.** One column, no second table, no referential integrity on "board must exist before posting." Posting to a new board creates it in the same stroke.
+- **Matches the A1 CLI (post-refactor).** After we flattened A1's table-per-board schema in an earlier review round, the CLI also uses one column and computes boards via `SELECT DISTINCT board`. Keeping the two layers architecturally aligned means future features transfer cleanly between them.
+- **Easy to evolve.** If an empty-boards registry is later needed (for description, privacy flags, ownership, etc.), a `boards` table can be added with a backfill of `SELECT DISTINCT board FROM posts` and the `GET /boards` query switches to `UNION` the two sources. None of the public-facing semantics change.
+
+### Why `POST /boards/{name}/posts` does not accept `board` in the body
+
+Having both `URL.{name}` and `body.board` forces a conflict-resolution decision (which wins? silent override? 409?). The cleanest move is to make the body schema physically incapable of carrying a `board` field — so the URL is authoritative *by construction*, not by policy. `BoardPostCreate` is a two-line Pydantic model with only `message`; the URL-derived name flows through the same `_insert_post()` helper that `POST /posts` uses, so both endpoints share one write path and cannot drift.
+
+### Pydantic pattern: `str` with `Field(default=...)` vs silver's `Optional[str]`
+
+Silver's `bio: Optional[str] = None` lets clients send `{"bio": null}` to mean "clear". Gold's `board: str = Field(default="general", ...)` is deliberately different:
+
+| Client sends | Silver `bio` | Gold `board` |
+|---|---|---|
+| field omitted | left unchanged (PATCH) | default applied (`"general"`) |
+| string value | validated & used | validated & used |
+| `null` | valid — clears to NULL | **422** (type mismatch — `str` field can't be null) |
+
+That asymmetry is intentional. A post without a board is nonsensical (every post needs a home), so we make it structurally impossible to send one.
+
+### Board name validation
+
+`^[a-zA-Z0-9_]+$`, max 32 chars. Same rules as the A1 CLI's `validate_board()` helper. Enforced in two places:
+
+- On the body (`POST /posts`), via `Field(pattern=..., max_length=32)` on the Pydantic model.
+- On the URL (`/boards/{name}/posts`), via `Path(pattern=..., max_length=32)` — the exact same regex, this time on the path parameter. A malformed URL returns 422 before any handler code runs.
+
+### What I added to verify_api.py for gold
+
+- Updated the `POST /posts` shape assertion in `run_post_checks` from 5 fields to 6 (added `board`).
+- Updated `run_field_shape_checks` expected post set from 5 to 6.
+- Renamed one historical silver-era assertion from "silver post shape" to "current post shape" and pointed it at the gold 6-field set — tier-bump hygiene.
+- New `run_gold_checks` function (20 end-to-end checks), called from `main()` after `run_silver_checks`. It verifies:
+  - POST /posts with no board → `board == "general"`.
+  - POST /posts with an explicit board → lands on that board.
+  - POST /posts with an invalid board name / `null` board → 422.
+  - GET /boards returns a 200 JSON array.
+  - GET /boards items have exactly `{name, post_count}`.
+  - GET /boards counts are correct for a seeded mix of boards.
+  - GET /boards/{existing}/posts filters to that board.
+  - GET /boards/{unposted}/posts returns 200 `[]` (filter semantics).
+  - GET /boards/{malformed}/posts returns 422 (Path regex).
+  - POST /boards/{name}/posts: 201, response has URL's board, gold shape.
+  - POST /boards/{name}/posts: 400 without X-Username, 404 with unknown user.
+  - GET /posts?board=X filters, and composes with `username` + `q`.
+
+### What I added to the pytest suite for gold
+
+Roughly 40 gold tests. Non-obvious bugs locked in:
+
+- **PATCH preserves board.** A future refactor that accidentally writes `UPDATE posts SET board = ?` based on a missing-but-defaulting Pydantic field would wipe the board. Test catches that.
+- **Deleting the last post in a board makes the board disappear from GET /boards.** No-row → no-group is correct behavior; the test pins that we don't accidentally cache a stale board list.
+- **POST /boards/{name}/posts via the convenience endpoint shows up in GET /boards.** End-to-end round-trip check that the two write paths touch the same storage.
+- **URL path validation mirrors body validation** — `/boards/has spaces/posts` returns 422, not a silent acceptance.
+- **`?board=ghost` returns 200 `[]`**, not 404 — same filter-vs-lookup distinction used for `?username=` in silver. Consistency across the API matters.
+- **All four filters compose at once** — `board`, `username`, `q`, and `limit` in a single test. If any of them drop out of the SQL builder, the test fires immediately.
