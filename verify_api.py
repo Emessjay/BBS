@@ -78,7 +78,7 @@ def main() -> int:
     #
     # When you've implemented it, uncomment the call below.
     # ==================================================================
-    # run_delete_checks(c, state)
+    run_delete_checks(c, state)
 
     # ==================================================================
     # STUDENT TODO #2: pagination on GET /posts
@@ -92,7 +92,7 @@ def main() -> int:
     #
     # When you've implemented it, uncomment the call below.
     # ==================================================================
-    # run_pagination_checks(c, state)
+    run_pagination_checks(c, state)
 
     # ==================================================================
     # STUDENT TODO #3: exact response field shapes
@@ -116,7 +116,7 @@ def main() -> int:
     #
     # When you've implemented it, uncomment the call below.
     # ==================================================================
-    # run_field_shape_checks(c, state)
+    run_field_shape_checks(c, state)
 
     print()
     print(f"{PASSED} passed, {FAILED} failed")
@@ -259,22 +259,166 @@ def run_search_checks(c: httpx.Client, state: dict) -> None:
 
 
 def run_delete_checks(c: httpx.Client, state: dict) -> None:
-    # STUDENT TODO #1: implement this function. See the comment above for
-    # the list of behaviors to verify. Use the `check()` helper.
-    raise NotImplementedError("student must implement run_delete_checks")
+    # We create a throw-away post specifically for this test instead
+    # of reusing state["alice_post_id"].  That keeps delete behaviour
+    # isolated from anything else in the run — if a later section ever
+    # assumes alice's first post is still there, we do not break it.
+    r = c.post("/posts", json={"message": "doomed"}, headers={"X-Username": ALICE})
+    check(
+        "DELETE setup: created a post to delete",
+        r.status_code == 201,
+        detail=f"got {r.status_code}",
+    )
+    if r.status_code != 201:
+        return   # nothing to delete; skip the rest
+    pid = r.json()["id"]
+
+    # Happy path: DELETE on an existing post is 204 (no content).
+    r = c.delete(f"/posts/{pid}")
+    check(f"DELETE /posts/{pid} returns 204", r.status_code == 204, detail=f"got {r.status_code}")
+
+    # After DELETE, GET on the same id must be 404.
+    r = c.get(f"/posts/{pid}")
+    check(
+        f"GET /posts/{pid} after DELETE returns 404",
+        r.status_code == 404,
+        detail=f"got {r.status_code}",
+    )
+
+    # DELETE on an id that doesn't exist is also 404.  We pick an id
+    # that is absurdly high to stay clear of anything another test
+    # could plausibly create.
+    r = c.delete("/posts/99999999")
+    check(
+        "DELETE /posts/99999999 (missing) returns 404",
+        r.status_code == 404,
+        detail=f"got {r.status_code}",
+    )
 
 
 def run_pagination_checks(c: httpx.Client, state: dict) -> None:
-    # STUDENT TODO #2: implement this function. See the comment above for
-    # the list of behaviors to verify. Use the `check()` helper.
-    raise NotImplementedError("student must implement run_pagination_checks")
+    # Seed enough posts for limit/offset math to be meaningful.  Five
+    # is enough to distinguish limit=2, offset=2, and offset beyond
+    # the end, without flooding the DB.
+    for i in range(5):
+        c.post(
+            "/posts",
+            json={"message": f"pagination seed {RUN} {i}"},
+            headers={"X-Username": ALICE},
+        )
+
+    # ?limit=N returns at most N items.  Using limit=2 and a corpus of
+    # >= 5 means we expect exactly 2 back.
+    r = c.get("/posts", params={"limit": 2})
+    check(
+        "GET /posts?limit=2 returns at most 2 items",
+        r.status_code == 200 and len(r.json()) <= 2,
+        detail=f"status {r.status_code}, len {len(r.json()) if r.status_code == 200 else '?'}",
+    )
+
+    # ?offset=K skips the first K items.  We compare the id-sets of
+    # the full response to the offset response — the offset call must
+    # leave behind exactly K ids from the top.
+    full = c.get("/posts", params={"limit": 100})
+    shifted = c.get("/posts", params={"limit": 100, "offset": 2})
+    if full.status_code == 200 and shifted.status_code == 200:
+        full_ids = {p["id"] for p in full.json()}
+        shift_ids = {p["id"] for p in shifted.json()}
+        missing = full_ids - shift_ids
+        check(
+            "GET /posts?offset=2 skips exactly 2 items",
+            len(missing) == 2,
+            detail=f"skipped {len(missing)} (expected 2)",
+        )
+    else:
+        check("GET /posts?offset setup requests both returned 200", False,
+              detail=f"full={full.status_code}, shifted={shifted.status_code}")
+
+    # Out-of-range validation.  These are produced by Pydantic's
+    # Query(ge=1, le=200) and Query(ge=0) — so 422, not 400.
+    r = c.get("/posts", params={"limit": 0})
+    check("GET /posts?limit=0 returns 422", r.status_code == 422, detail=f"got {r.status_code}")
+
+    r = c.get("/posts", params={"limit": 500})
+    check("GET /posts?limit=500 returns 422", r.status_code == 422, detail=f"got {r.status_code}")
+
+    r = c.get("/posts", params={"offset": -1})
+    check("GET /posts?offset=-1 returns 422", r.status_code == 422, detail=f"got {r.status_code}")
 
 
 def run_field_shape_checks(c: httpx.Client, state: dict) -> None:
-    # STUDENT TODO #3: implement this function. See the comment above for
-    # the full spec. Assert that each response body has EXACTLY the
-    # expected set of keys (set equality, not a subset check).
-    raise NotImplementedError("student must implement run_field_shape_checks")
+    # We create fresh entities inside this function so we're asserting
+    # on KNOWN responses — not responses that earlier sections might
+    # have dirtied with extra fields.  Every assertion below is
+    # SET-EQUALITY, so an extra field fails just as loudly as a
+    # missing one.
+
+    expected_user = {"username", "created_at"}
+    expected_post = {"id", "username", "message", "created_at"}
+
+    # ── User shape: POST, GET one, and items in GET all ───────────
+    fresh_user = f"shape_{RUN}"
+    r = c.post("/users", json={"username": fresh_user})
+    if r.status_code == 201:
+        body = r.json()
+        check(
+            f"POST /users response has exactly {expected_user}",
+            set(body.keys()) == expected_user,
+            detail=str(body),
+        )
+
+    r = c.get(f"/users/{fresh_user}")
+    if r.status_code == 200:
+        body = r.json()
+        check(
+            f"GET /users/{{username}} response has exactly {expected_user}",
+            set(body.keys()) == expected_user,
+            detail=str(body),
+        )
+
+    r = c.get("/users")
+    if r.status_code == 200 and isinstance(r.json(), list) and r.json():
+        # Pick the item we just created so we're asserting on a known
+        # row, not whatever happened to land first.
+        item = next((u for u in r.json() if u.get("username") == fresh_user), r.json()[0])
+        check(
+            f"GET /users item has exactly {expected_user}",
+            set(item.keys()) == expected_user,
+            detail=str(item),
+        )
+
+    # ── Post shape: POST, GET one, and items in GET all ───────────
+    r = c.post(
+        "/posts",
+        json={"message": f"shape check {RUN}"},
+        headers={"X-Username": fresh_user},
+    )
+    if r.status_code == 201:
+        body = r.json()
+        check(
+            f"POST /posts response has exactly {expected_post}",
+            set(body.keys()) == expected_post,
+            detail=str(body),
+        )
+        pid = body["id"]
+
+        r = c.get(f"/posts/{pid}")
+        if r.status_code == 200:
+            body = r.json()
+            check(
+                f"GET /posts/{{id}} response has exactly {expected_post}",
+                set(body.keys()) == expected_post,
+                detail=str(body),
+            )
+
+        r = c.get("/posts")
+        if r.status_code == 200 and isinstance(r.json(), list) and r.json():
+            item = next((p for p in r.json() if p.get("id") == pid), r.json()[0])
+            check(
+                f"GET /posts item has exactly {expected_post}",
+                set(item.keys()) == expected_post,
+                detail=str(item),
+            )
 
 
 if __name__ == "__main__":
