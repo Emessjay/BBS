@@ -118,6 +118,17 @@ def main() -> int:
     # ==================================================================
     run_field_shape_checks(c, state)
 
+    # ==================================================================
+    # SILVER CHECKS
+    #
+    # Everything above this line is bronze.  run_silver_checks below
+    # exercises the silver-tier features: bio/post_count on users,
+    # updated_at on posts, PATCH /users/{username}, PATCH /posts/{id}
+    # (with its ownership policy), and the ?username= filter on
+    # GET /posts.
+    # ==================================================================
+    run_silver_checks(c, state)
+
     print()
     print(f"{PASSED} passed, {FAILED} failed")
     return 0 if FAILED == 0 else 1
@@ -128,9 +139,13 @@ def run_user_checks(c: httpx.Client, state: dict) -> None:
     check("POST /users creates a user (201)", r.status_code == 201, detail=f"got {r.status_code}")
     if r.status_code == 201:
         body = r.json()
+        # Silver user shape: {username, created_at, bio, post_count}.
+        # Bronze's {username, created_at} has been superseded — the
+        # spec ships silver as a strict superset of bronze's fields.
         check(
-            "POST /users response has exactly username and created_at",
-            set(body.keys()) == {"username", "created_at"} and body["username"] == ALICE,
+            "POST /users response has exactly username, created_at, bio, post_count",
+            set(body.keys()) == {"username", "created_at", "bio", "post_count"}
+                and body["username"] == ALICE,
             detail=str(body),
         )
 
@@ -177,9 +192,10 @@ def run_post_checks(c: httpx.Client, state: dict) -> None:
     check("POST /posts with X-Username returns 201", r.status_code == 201, detail=f"got {r.status_code}")
     if r.status_code == 201:
         body = r.json()
-        expected_keys = {"id", "username", "message", "created_at"}
+        # Silver post shape adds updated_at (null until first PATCH).
+        expected_keys = {"id", "username", "message", "created_at", "updated_at"}
         check(
-            "POST /posts response has exactly id, username, message, created_at",
+            "POST /posts response has exactly id, username, message, created_at, updated_at",
             set(body.keys()) == expected_keys,
             detail=str(body),
         )
@@ -353,8 +369,13 @@ def run_field_shape_checks(c: httpx.Client, state: dict) -> None:
     # SET-EQUALITY, so an extra field fails just as loudly as a
     # missing one.
 
-    expected_user = {"username", "created_at"}
-    expected_post = {"id", "username", "message", "created_at"}
+    # Silver widens the shapes:
+    #   users gain `bio` (nullable) and `post_count` (computed)
+    #   posts gain `updated_at` (null until first PATCH)
+    # Set-equality still applies — we just compare against the bigger
+    # set.  An extra or missing field fails exactly as before.
+    expected_user = {"username", "created_at", "bio", "post_count"}
+    expected_post = {"id", "username", "message", "created_at", "updated_at"}
 
     # ── User shape: POST, GET one, and items in GET all ───────────
     fresh_user = f"shape_{RUN}"
@@ -419,6 +440,202 @@ def run_field_shape_checks(c: httpx.Client, state: dict) -> None:
                 set(item.keys()) == expected_post,
                 detail=str(item),
             )
+
+
+def run_silver_checks(c: httpx.Client, state: dict) -> None:
+    # Silver adds four things worth verifying end-to-end:
+    #   1. bio + post_count on every user response
+    #   2. updated_at on every post response
+    #   3. PATCH /users/{username} and PATCH /posts/{id}
+    #   4. GET /posts?username=<user> filter
+    #
+    # Everything here creates fresh entities so we do not step on
+    # any state the bronze sections rely on.
+
+    sv_alice = f"sv_alice_{RUN}"
+    sv_bob   = f"sv_bob_{RUN}"
+
+    # Setup — two silver users.  We need two so the ownership test
+    # on PATCH /posts/{id} has somebody to impersonate unsuccessfully.
+    c.post("/users", json={"username": sv_alice})
+    c.post("/users", json={"username": sv_bob})
+
+    # ── bio + post_count defaults ───────────────────────────────
+    r = c.get(f"/users/{sv_alice}")
+    if r.status_code == 200:
+        body = r.json()
+        check(
+            f"GET /users/{sv_alice} has bio=null for a fresh user",
+            body.get("bio") is None,
+            detail=str(body),
+        )
+        check(
+            f"GET /users/{sv_alice} has post_count=0 for a fresh user",
+            body.get("post_count") == 0,
+            detail=str(body),
+        )
+
+    # ── post_count reacts to new posts ──────────────────────────
+    c.post("/posts", json={"message": f"sv {RUN} one"},   headers={"X-Username": sv_alice})
+    c.post("/posts", json={"message": f"sv {RUN} two"},   headers={"X-Username": sv_alice})
+    r = c.get(f"/users/{sv_alice}")
+    if r.status_code == 200:
+        check(
+            f"GET /users/{sv_alice} post_count==2 after two posts",
+            r.json().get("post_count") == 2,
+            detail=str(r.json()),
+        )
+
+    # ── PATCH /users/{username} ─────────────────────────────────
+    r = c.patch(f"/users/{sv_alice}", json={"bio": "wolf in dog suit"})
+    check(
+        f"PATCH /users/{sv_alice} returns 200",
+        r.status_code == 200,
+        detail=f"got {r.status_code}",
+    )
+    if r.status_code == 200:
+        check(
+            f"PATCH /users/{sv_alice} response bio echoes input",
+            r.json().get("bio") == "wolf in dog suit",
+            detail=str(r.json()),
+        )
+        check(
+            f"PATCH /users/{sv_alice} response has silver user shape",
+            set(r.json().keys()) == {"username", "created_at", "bio", "post_count"},
+            detail=str(r.json()),
+        )
+
+    # 422 — bio exceeds 200 chars
+    r = c.patch(f"/users/{sv_alice}", json={"bio": "x" * 201})
+    check(
+        "PATCH /users with 201-char bio returns 422",
+        r.status_code == 422,
+        detail=f"got {r.status_code}",
+    )
+
+    # null bio clears the stored value
+    r = c.patch(f"/users/{sv_alice}", json={"bio": None})
+    if r.status_code == 200:
+        check(
+            "PATCH /users with {bio: null} clears the bio",
+            r.json().get("bio") is None,
+            detail=str(r.json()),
+        )
+
+    # 404 — unknown user
+    r = c.patch(f"/users/{GHOST}", json={"bio": "hi"})
+    check(
+        f"PATCH /users/{GHOST} (missing) returns 404",
+        r.status_code == 404,
+        detail=f"got {r.status_code}",
+    )
+
+    # ── PATCH /posts/{id} + ownership ───────────────────────────
+    # Make a post owned by sv_alice so we can edit / fail-to-edit it.
+    pr = c.post(
+        "/posts",
+        json={"message": f"sv patch target {RUN}"},
+        headers={"X-Username": sv_alice},
+    )
+    if pr.status_code == 201:
+        pid = pr.json()["id"]
+
+        # Happy path: owner edits their own post.
+        r = c.patch(
+            f"/posts/{pid}",
+            json={"message": f"edited {RUN}"},
+            headers={"X-Username": sv_alice},
+        )
+        check(
+            f"PATCH /posts/{pid} by owner returns 200",
+            r.status_code == 200,
+            detail=f"got {r.status_code}",
+        )
+        if r.status_code == 200:
+            check(
+                f"PATCH /posts/{pid} response message updated",
+                r.json().get("message") == f"edited {RUN}",
+                detail=str(r.json()),
+            )
+            check(
+                f"PATCH /posts/{pid} response updated_at is set (not null)",
+                r.json().get("updated_at") is not None,
+                detail=str(r.json()),
+            )
+            check(
+                f"PATCH /posts/{pid} response has silver post shape",
+                set(r.json().keys()) == {
+                    "id", "username", "message", "created_at", "updated_at"
+                },
+                detail=str(r.json()),
+            )
+
+        # 400 — missing X-Username
+        r = c.patch(f"/posts/{pid}", json={"message": "x"})
+        check(
+            f"PATCH /posts/{pid} without X-Username returns 400",
+            r.status_code == 400,
+            detail=f"got {r.status_code}",
+        )
+
+        # 403 — wrong author (bob can't edit alice's post)
+        r = c.patch(
+            f"/posts/{pid}",
+            json={"message": "hostile"},
+            headers={"X-Username": sv_bob},
+        )
+        check(
+            f"PATCH /posts/{pid} by non-owner returns 403 (ownership policy A)",
+            r.status_code == 403,
+            detail=f"got {r.status_code}",
+        )
+
+    # 404 — nonexistent post
+    r = c.patch(
+        "/posts/99999999",
+        json={"message": "x"},
+        headers={"X-Username": sv_alice},
+    )
+    check(
+        "PATCH /posts/99999999 (missing) returns 404",
+        r.status_code == 404,
+        detail=f"got {r.status_code}",
+    )
+
+    # ── GET /posts?username= filter ─────────────────────────────
+    # sv_alice has posts; sv_bob has none yet.  Filtering to each
+    # should give us their own posts and nothing else.
+    r = c.get("/posts", params={"username": sv_alice})
+    if r.status_code == 200:
+        rows = r.json()
+        check(
+            f"GET /posts?username={sv_alice} returns only that user's posts",
+            rows and all(p.get("username") == sv_alice for p in rows),
+            detail=str([p.get("username") for p in rows]),
+        )
+
+    r = c.get("/posts", params={"username": sv_bob})
+    if r.status_code == 200:
+        check(
+            f"GET /posts?username={sv_bob} (no posts) returns empty array",
+            r.json() == [],
+            detail=str(r.json()),
+        )
+
+    # Unknown username — 200 with [], NOT 404 (it's a filter, not
+    # a lookup).  This mirrors GET /posts?q=nomatch behaviour.
+    r = c.get("/posts", params={"username": GHOST})
+    check(
+        f"GET /posts?username={GHOST} (unknown) returns 200",
+        r.status_code == 200,
+        detail=f"got {r.status_code}",
+    )
+    if r.status_code == 200:
+        check(
+            f"GET /posts?username={GHOST} (unknown) returns empty array",
+            r.json() == [],
+            detail=str(r.json()),
+        )
 
 
 if __name__ == "__main__":

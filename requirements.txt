@@ -1,0 +1,8 @@
+# Runtime — A2 webserver
+fastapi==0.136.0
+uvicorn==0.45.0
+httpx==0.28.1
+
+# Dev — test suite
+pytest==9.0.3
+pytest-randomly==4.1.0

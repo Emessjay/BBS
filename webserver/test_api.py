@@ -32,12 +32,20 @@ import pytest
 # ──────────────────────────────────────────────────────────────────────
 #
 # A2 is very strict about what fields appear in a response.  A user
-# object must have EXACTLY {username, created_at} — not a subset, not
-# a superset.  These two sets are the source of truth for that check.
+# object must have EXACTLY these fields — not a subset, not a
+# superset.  These two sets are the source of truth for that check.
 # The verifier's STUDENT TODO #3 compares set(body.keys()) against
 # these, and so do we.
-USER_FIELDS = {"username", "created_at"}
-POST_FIELDS = {"id", "username", "message", "created_at"}
+#
+# Silver-tier shapes:
+#   - users  gain  bio (nullable) and post_count (computed)
+#   - posts  gain  updated_at (nullable, set by PATCH /posts/{id})
+# Every existing field-shape test automatically checks these expanded
+# sets because it reads from these constants.  Bronze-only callers
+# would need {"username", "created_at"} / {"id", "username", "message",
+# "created_at"}; we deliberately moved past that here.
+USER_FIELDS = {"username", "created_at", "bio", "post_count"}
+POST_FIELDS = {"id", "username", "message", "created_at", "updated_at"}
 
 # created_at is documented as ISO-8601 with second precision and no
 # timezone — e.g. "2026-04-13T14:01:32".  A regex is enough to catch
@@ -677,3 +685,516 @@ def test_409_body_shape(client, alice):
     r = client.post("/users", json={"username": "alice"})
     assert r.status_code == 409
     assert "detail" in r.json()
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  SILVER — user shape additions (bio + post_count)
+# ══════════════════════════════════════════════════════════════════════
+#
+# Silver widens the user object from {username, created_at} to
+# {username, created_at, bio, post_count}.  The field-shape constants
+# at the top of this file already reflect the new sets, so every
+# existing "exact fields" test automatically checks them.  The tests
+# below pin down the SEMANTICS of the two new fields — specifically,
+# what values they take under what conditions.
+
+def test_silver_fresh_user_has_null_bio(client):
+    # A brand-new user has never set a bio, so it is JSON null.
+    # This is a conscious default-null choice; the spec allows either
+    # null or absent-with-a-getter, and JSON null is the cleanest.
+    body = client.post("/users", json={"username": "alice"}).json()
+    assert body["bio"] is None
+
+
+def test_silver_fresh_user_has_post_count_zero(client):
+    # Computed field — never stored, derived from the posts table on
+    # read.  A user who just came into existence has posted nothing.
+    body = client.post("/users", json={"username": "alice"}).json()
+    assert body["post_count"] == 0
+
+
+def test_silver_post_count_increments_with_each_post(client, alice):
+    # post_count is computed, not stored, so each lookup must reflect
+    # the current state of the posts table.
+    assert client.get("/users/alice").json()["post_count"] == 0
+    client.post("/posts", json={"message": "m1"}, headers={"X-Username": "alice"})
+    assert client.get("/users/alice").json()["post_count"] == 1
+    client.post("/posts", json={"message": "m2"}, headers={"X-Username": "alice"})
+    client.post("/posts", json={"message": "m3"}, headers={"X-Username": "alice"})
+    assert client.get("/users/alice").json()["post_count"] == 3
+
+
+def test_silver_post_count_decrements_after_delete(client, alice):
+    # The other direction: deleting a post must reduce post_count.
+    # Specifically tests that the field is computed per-request, not
+    # cached somewhere that would go stale after a DELETE.
+    ids = [
+        client.post("/posts", json={"message": f"m{i}"},
+                    headers={"X-Username": "alice"}).json()["id"]
+        for i in range(3)
+    ]
+    assert client.get("/users/alice").json()["post_count"] == 3
+    client.delete(f"/posts/{ids[0]}")
+    assert client.get("/users/alice").json()["post_count"] == 2
+    client.delete(f"/posts/{ids[1]}")
+    client.delete(f"/posts/{ids[2]}")
+    assert client.get("/users/alice").json()["post_count"] == 0
+
+
+def test_silver_list_users_has_post_count_per_user(client, alice, bob):
+    # When GET /users joins posts for counts, a naive JOIN can drop
+    # rows for users with no posts.  This test catches a LEFT JOIN
+    # that's actually an INNER JOIN in disguise.
+    client.post("/posts", json={"message": "x"}, headers={"X-Username": "alice"})
+    body = client.get("/users").json()
+    counts = {u["username"]: u["post_count"] for u in body}
+    assert counts == {"alice": 1, "bob": 0}
+
+
+def test_silver_list_users_items_have_all_four_fields(client, alice):
+    # The expanded USER_FIELDS constant locks this down, but making
+    # it a dedicated silver test documents the intent.
+    item = client.get("/users").json()[0]
+    assert set(item.keys()) == {"username", "created_at", "bio", "post_count"}
+
+
+def test_silver_bio_is_preserved_in_get(client, alice):
+    # After PATCH sets bio, subsequent GETs should return the same
+    # value.  This exists so "bio in list != bio by id" regressions
+    # surface loudly.
+    client.patch("/users/alice", json={"bio": "wolf in dog suit"})
+    single = client.get("/users/alice").json()
+    listed = next(u for u in client.get("/users").json() if u["username"] == "alice")
+    assert single["bio"] == "wolf in dog suit"
+    assert listed["bio"] == "wolf in dog suit"
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  SILVER — post shape additions (updated_at)
+# ══════════════════════════════════════════════════════════════════════
+
+def test_silver_fresh_post_updated_at_is_null(client, alice):
+    # Never-edited posts carry updated_at=null, not a copy of
+    # created_at.  null cleanly signals "never touched".
+    body = client.post("/posts", json={"message": "hi"},
+                       headers={"X-Username": "alice"}).json()
+    assert body["updated_at"] is None
+
+
+def test_silver_fresh_post_has_five_fields(client, alice):
+    body = client.post("/posts", json={"message": "hi"},
+                       headers={"X-Username": "alice"}).json()
+    assert set(body.keys()) == {"id", "username", "message", "created_at", "updated_at"}
+
+
+def test_silver_get_post_by_id_includes_updated_at(client, alice):
+    pid = client.post("/posts", json={"message": "hi"},
+                      headers={"X-Username": "alice"}).json()["id"]
+    body = client.get(f"/posts/{pid}").json()
+    assert "updated_at" in body
+
+
+def test_silver_list_posts_items_include_updated_at(client, alice):
+    client.post("/posts", json={"message": "a"}, headers={"X-Username": "alice"})
+    client.post("/posts", json={"message": "b"}, headers={"X-Username": "alice"})
+    for item in client.get("/posts").json():
+        assert "updated_at" in item
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  SILVER — PATCH /users/{username}
+# ══════════════════════════════════════════════════════════════════════
+#
+# Semantics:
+#   - Body {"bio": "x"} sets bio to "x".
+#   - Body {"bio": null} clears bio back to null.
+#   - Body {} is a 200 no-op (nothing to update, nothing fails).
+#   - Any other fields in the body are silently ignored (PATCH is
+#     tolerant by design — clients shipping future versions of the
+#     shape should not crash current servers).
+#   - The response body is the full updated user in the silver shape.
+
+def test_patch_user_bio_returns_200(client, alice):
+    r = client.patch("/users/alice", json={"bio": "hello"})
+    assert r.status_code == 200
+
+
+def test_patch_user_bio_updates_value(client, alice):
+    client.patch("/users/alice", json={"bio": "hello"})
+    assert client.get("/users/alice").json()["bio"] == "hello"
+
+
+def test_patch_user_bio_at_max_length_passes(client, alice):
+    # Boundary: exactly 200 chars is the documented cap.
+    r = client.patch("/users/alice", json={"bio": "x" * 200})
+    assert r.status_code == 200
+
+
+def test_patch_user_bio_too_long_returns_422(client, alice):
+    # 201 chars — one over.
+    r = client.patch("/users/alice", json={"bio": "x" * 201})
+    assert r.status_code == 422
+
+
+def test_patch_user_bio_null_clears_existing(client, alice):
+    # Two PATCHes: first sets a bio, second clears it back to null.
+    # Distinguishes "clear" (explicit null) from "leave alone" (omitted).
+    client.patch("/users/alice", json={"bio": "something"})
+    assert client.get("/users/alice").json()["bio"] == "something"
+    client.patch("/users/alice", json={"bio": None})
+    assert client.get("/users/alice").json()["bio"] is None
+
+
+def test_patch_user_empty_body_is_noop_200(client, alice):
+    # PATCH with {} means "no changes requested".  200 with current
+    # state is the idiomatic response — not 400, not 422.
+    client.patch("/users/alice", json={"bio": "kept"})
+    r = client.patch("/users/alice", json={})
+    assert r.status_code == 200
+    assert r.json()["bio"] == "kept"   # unchanged
+
+
+def test_patch_user_404_when_missing(client):
+    r = client.patch("/users/ghost", json={"bio": "hi"})
+    assert r.status_code == 404
+
+
+def test_patch_user_response_has_silver_shape(client, alice):
+    # The response is a full UserOut, not just the patched field.
+    body = client.patch("/users/alice", json={"bio": "hi"}).json()
+    assert set(body.keys()) == {"username", "created_at", "bio", "post_count"}
+
+
+def test_patch_user_ignores_unknown_fields(client, alice):
+    # Forward-compat: a client shipping a future "avatar" field
+    # should not break on today's server.  Unknown keys silently drop.
+    r = client.patch("/users/alice",
+                     json={"bio": "kept", "avatar": "x.png", "username": "mallory"})
+    assert r.status_code == 200
+    assert r.json()["username"] == "alice"   # NOT "mallory"
+    assert r.json()["bio"] == "kept"
+    assert "avatar" not in r.json()
+
+
+def test_patch_user_bio_empty_string_allowed(client, alice):
+    # Distinct from null.  "" is a valid (empty) bio — a user who
+    # actively cleared their bio text without nulling the field.
+    # If the implementation accidentally treats "" as null the
+    # response would show None here.
+    r = client.patch("/users/alice", json={"bio": ""})
+    assert r.status_code == 200
+    assert r.json()["bio"] == ""
+
+
+def test_patch_user_bio_preserves_unicode(client, alice):
+    bio = "café ☕ 世界"
+    client.patch("/users/alice", json={"bio": bio})
+    assert client.get("/users/alice").json()["bio"] == bio
+
+
+def test_patch_user_bio_preserves_newlines(client, alice):
+    bio = "line one\nline two"
+    client.patch("/users/alice", json={"bio": bio})
+    assert client.get("/users/alice").json()["bio"] == bio
+
+
+def test_patch_user_non_string_bio_returns_422(client, alice):
+    # Type check: bio must be a string (or null).  A number is a
+    # type error — Pydantic rejects it.
+    r = client.patch("/users/alice", json={"bio": 42})
+    assert r.status_code == 422
+
+
+def test_patch_user_preserves_post_count(client, alice):
+    # Bio updates are orthogonal to the posts count.  This test
+    # guards against a future refactor that accidentally invalidates
+    # post_count on user write paths.
+    client.post("/posts", json={"message": "x"}, headers={"X-Username": "alice"})
+    client.post("/posts", json={"message": "y"}, headers={"X-Username": "alice"})
+    body = client.patch("/users/alice", json={"bio": "hi"}).json()
+    assert body["post_count"] == 2
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  SILVER — PATCH /posts/{id}  (ownership = X-Username match)
+# ══════════════════════════════════════════════════════════════════════
+#
+# Ownership policy chosen: only the original author (the username
+# stored on the post) can edit it, and that identity is claimed via
+# the X-Username header.  Yes, X-Username is not real authentication
+# — but wiring the CONCEPT of ownership in now means the switch to
+# real auth later is a one-line change in the identity check.
+#
+# Status-code plan for PATCH /posts/{id}:
+#   400 — X-Username missing or empty
+#   404 — post does not exist
+#   403 — post exists but X-Username does not match the author
+#   422 — message body fails validation (empty, too long, null)
+#   200 — OK
+#
+# Order of checks: header presence (400) → post lookup (404) →
+# ownership (403) → body validation (handled by Pydantic before the
+# handler runs, so 422 wins on malformed bodies regardless).
+
+def test_patch_post_returns_200(client, alice):
+    pid = client.post("/posts", json={"message": "old"},
+                      headers={"X-Username": "alice"}).json()["id"]
+    r = client.patch(f"/posts/{pid}", json={"message": "new"},
+                     headers={"X-Username": "alice"})
+    assert r.status_code == 200
+
+
+def test_patch_post_updates_message(client, alice):
+    pid = client.post("/posts", json={"message": "old"},
+                      headers={"X-Username": "alice"}).json()["id"]
+    client.patch(f"/posts/{pid}", json={"message": "new"},
+                 headers={"X-Username": "alice"})
+    assert client.get(f"/posts/{pid}").json()["message"] == "new"
+
+
+def test_patch_post_sets_updated_at(client, alice):
+    # Before PATCH: updated_at is null.
+    # After PATCH: updated_at is a non-null ISO string.
+    pid = client.post("/posts", json={"message": "old"},
+                      headers={"X-Username": "alice"}).json()["id"]
+    assert client.get(f"/posts/{pid}").json()["updated_at"] is None
+    client.patch(f"/posts/{pid}", json={"message": "new"},
+                 headers={"X-Username": "alice"})
+    updated_at = client.get(f"/posts/{pid}").json()["updated_at"]
+    assert updated_at is not None
+    assert ISO_SECONDS_RE.match(updated_at)
+
+
+def test_patch_post_max_length_passes(client, alice):
+    pid = client.post("/posts", json={"message": "old"},
+                      headers={"X-Username": "alice"}).json()["id"]
+    r = client.patch(f"/posts/{pid}", json={"message": "x" * 500},
+                     headers={"X-Username": "alice"})
+    assert r.status_code == 200
+
+
+def test_patch_post_empty_message_returns_422(client, alice):
+    pid = client.post("/posts", json={"message": "old"},
+                      headers={"X-Username": "alice"}).json()["id"]
+    r = client.patch(f"/posts/{pid}", json={"message": ""},
+                     headers={"X-Username": "alice"})
+    assert r.status_code == 422
+
+
+def test_patch_post_too_long_returns_422(client, alice):
+    pid = client.post("/posts", json={"message": "old"},
+                      headers={"X-Username": "alice"}).json()["id"]
+    r = client.patch(f"/posts/{pid}", json={"message": "x" * 501},
+                     headers={"X-Username": "alice"})
+    assert r.status_code == 422
+
+
+def test_patch_post_null_message_returns_422(client, alice):
+    # An explicit null message is nonsensical (a post needs a
+    # message), and different from omitting the field.  Must fail.
+    pid = client.post("/posts", json={"message": "old"},
+                      headers={"X-Username": "alice"}).json()["id"]
+    r = client.patch(f"/posts/{pid}", json={"message": None},
+                     headers={"X-Username": "alice"})
+    assert r.status_code == 422
+
+
+def test_patch_post_missing_x_username_returns_400(client, alice):
+    pid = client.post("/posts", json={"message": "old"},
+                      headers={"X-Username": "alice"}).json()["id"]
+    r = client.patch(f"/posts/{pid}", json={"message": "new"})
+    assert r.status_code == 400
+
+
+def test_patch_post_empty_x_username_returns_400(client, alice):
+    # Same as POST /posts: empty string treated as missing.
+    pid = client.post("/posts", json={"message": "old"},
+                      headers={"X-Username": "alice"}).json()["id"]
+    r = client.patch(f"/posts/{pid}", json={"message": "new"},
+                     headers={"X-Username": ""})
+    assert r.status_code == 400
+
+
+def test_patch_post_wrong_author_returns_403(client, alice, bob):
+    # Ownership check.  alice's post, bob tries to edit.  403 is the
+    # correct code — the request is well-formed, but the caller is
+    # not authorized for this specific resource.  A 401 would mean
+    # "who are you?" (we don't know) but here we know who the caller
+    # claims to be; they just don't own the post.
+    pid = client.post("/posts", json={"message": "alice's"},
+                      headers={"X-Username": "alice"}).json()["id"]
+    r = client.patch(f"/posts/{pid}", json={"message": "bob's"},
+                     headers={"X-Username": "bob"})
+    assert r.status_code == 403
+
+
+def test_patch_post_wrong_author_does_not_update(client, alice, bob):
+    # Defense in depth: the 403 must be a true refusal, not "I
+    # returned 403 but the write already happened".
+    pid = client.post("/posts", json={"message": "alice's"},
+                      headers={"X-Username": "alice"}).json()["id"]
+    client.patch(f"/posts/{pid}", json={"message": "bob's"},
+                 headers={"X-Username": "bob"})
+    assert client.get(f"/posts/{pid}").json()["message"] == "alice's"
+    assert client.get(f"/posts/{pid}").json()["updated_at"] is None
+
+
+def test_patch_post_nonexistent_returns_404(client, alice):
+    r = client.patch("/posts/99999999", json={"message": "new"},
+                     headers={"X-Username": "alice"})
+    assert r.status_code == 404
+
+
+def test_patch_post_nonexistent_trumps_wrong_author(client, alice):
+    # Order-of-checks test: if the post doesn't exist, we return 404
+    # even when the X-Username is unknown.  Existence is checked
+    # before ownership.  (The alternative — 403 everywhere to avoid
+    # leaking whether the id exists — is an infosec hardening move,
+    # but 404 is the plain-REST default.)
+    r = client.patch("/posts/99999999", json={"message": "new"},
+                     headers={"X-Username": "ghost"})
+    assert r.status_code == 404
+
+
+def test_patch_post_empty_body_is_noop_200(client, alice):
+    pid = client.post("/posts", json={"message": "kept"},
+                      headers={"X-Username": "alice"}).json()["id"]
+    r = client.patch(f"/posts/{pid}", json={},
+                     headers={"X-Username": "alice"})
+    assert r.status_code == 200
+    assert r.json()["message"] == "kept"
+
+
+def test_patch_post_empty_body_does_not_set_updated_at(client, alice):
+    # If the PATCH changed nothing, updated_at stays null.  Bumping
+    # it on a no-op would lie about resource history.
+    pid = client.post("/posts", json={"message": "kept"},
+                      headers={"X-Username": "alice"}).json()["id"]
+    client.patch(f"/posts/{pid}", json={},
+                 headers={"X-Username": "alice"})
+    assert client.get(f"/posts/{pid}").json()["updated_at"] is None
+
+
+def test_patch_post_response_has_silver_shape(client, alice):
+    pid = client.post("/posts", json={"message": "old"},
+                      headers={"X-Username": "alice"}).json()["id"]
+    body = client.patch(f"/posts/{pid}", json={"message": "new"},
+                        headers={"X-Username": "alice"}).json()
+    assert set(body.keys()) == {"id", "username", "message", "created_at", "updated_at"}
+
+
+def test_patch_post_preserves_unicode(client, alice):
+    pid = client.post("/posts", json={"message": "old"},
+                      headers={"X-Username": "alice"}).json()["id"]
+    new = "héllo 🌮 世界"
+    client.patch(f"/posts/{pid}", json={"message": new},
+                 headers={"X-Username": "alice"})
+    assert client.get(f"/posts/{pid}").json()["message"] == new
+
+
+def test_patch_post_twice_refreshes_updated_at(client, alice):
+    # A second PATCH should (re)set updated_at to a valid ISO string.
+    # We don't assert the second > the first because seconds-level
+    # precision can tie on a fast machine; we just require the field
+    # is still set and well-formed.
+    pid = client.post("/posts", json={"message": "v0"},
+                      headers={"X-Username": "alice"}).json()["id"]
+    client.patch(f"/posts/{pid}", json={"message": "v1"},
+                 headers={"X-Username": "alice"})
+    ts1 = client.get(f"/posts/{pid}").json()["updated_at"]
+    client.patch(f"/posts/{pid}", json={"message": "v2"},
+                 headers={"X-Username": "alice"})
+    ts2 = client.get(f"/posts/{pid}").json()["updated_at"]
+    assert ts1 is not None and ISO_SECONDS_RE.match(ts1)
+    assert ts2 is not None and ISO_SECONDS_RE.match(ts2)
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  SILVER — GET /posts?username=  (filter by author)
+# ══════════════════════════════════════════════════════════════════════
+#
+# ?username= is a filter on the posts list.  It composes with ?q=
+# (intersection) and with limit/offset (filter first, paginate the
+# filtered result).  Unknown usernames return 200 [] — this is a
+# FILTER, not a LOOKUP, so "no matches" is the right semantic, not
+# "resource missing".
+
+def test_filter_by_username_returns_only_that_user(client, alice, bob):
+    client.post("/posts", json={"message": "a1"}, headers={"X-Username": "alice"})
+    client.post("/posts", json={"message": "a2"}, headers={"X-Username": "alice"})
+    client.post("/posts", json={"message": "b1"}, headers={"X-Username": "bob"})
+    body = client.get("/posts", params={"username": "alice"}).json()
+    assert len(body) == 2
+    assert all(p["username"] == "alice" for p in body)
+
+
+def test_filter_by_unknown_username_returns_empty_array(client, alice):
+    # Contrast with GET /users/{username}/posts, where an unknown
+    # user is 404.  There, {username} is a PATH parameter — part of
+    # the resource identifier — so missing = 404.  Here, ?username=
+    # is a QUERY parameter — a filter — so no match = [].
+    client.post("/posts", json={"message": "hi"}, headers={"X-Username": "alice"})
+    r = client.get("/posts", params={"username": "ghost"})
+    assert r.status_code == 200
+    assert r.json() == []
+
+
+def test_filter_by_username_empty_for_user_with_no_posts(client, alice):
+    # Valid user, zero posts — also 200 [].
+    r = client.get("/posts", params={"username": "alice"})
+    assert r.status_code == 200
+    assert r.json() == []
+
+
+def test_filter_by_username_composes_with_q(client, alice, bob):
+    # Intersection: alice's posts AND containing "keep".
+    # Hits both the filter and the search at the same time.
+    client.post("/posts", json={"message": "alice keep"}, headers={"X-Username": "alice"})
+    client.post("/posts", json={"message": "alice drop"}, headers={"X-Username": "alice"})
+    client.post("/posts", json={"message": "bob keep"},   headers={"X-Username": "bob"})
+    body = client.get("/posts", params={"username": "alice", "q": "keep"}).json()
+    assert len(body) == 1
+    assert body[0]["message"] == "alice keep"
+
+
+def test_filter_by_username_composes_with_limit(client, alice, bob):
+    # 5 alice posts, filter to alice, limit 3 → 3 alice posts.
+    # Confirms that limit applies to the FILTERED result, not the
+    # raw posts table.
+    for i in range(5):
+        client.post("/posts", json={"message": f"a{i}"},
+                    headers={"X-Username": "alice"})
+    for i in range(5):
+        client.post("/posts", json={"message": f"b{i}"},
+                    headers={"X-Username": "bob"})
+    body = client.get("/posts", params={"username": "alice", "limit": 3}).json()
+    assert len(body) == 3
+    assert all(p["username"] == "alice" for p in body)
+
+
+def test_filter_by_username_composes_with_offset(client, alice):
+    # 5 posts, filter to alice (all of them), offset 2 → 3 posts.
+    for i in range(5):
+        client.post("/posts", json={"message": f"a{i}"},
+                    headers={"X-Username": "alice"})
+    body = client.get("/posts", params={"username": "alice", "offset": 2}).json()
+    assert len(body) == 3
+
+
+def test_filter_by_username_plus_q_plus_pagination(client, alice, bob):
+    # Full composition: username=alice, q=keep, limit=2.
+    # 3 alice-keep posts; limit 2 should return 2 of them.
+    for i in range(3):
+        client.post("/posts", json={"message": f"keep {i}"},
+                    headers={"X-Username": "alice"})
+    for i in range(3):
+        client.post("/posts", json={"message": f"drop {i}"},
+                    headers={"X-Username": "alice"})
+    for i in range(3):
+        client.post("/posts", json={"message": f"keep {i}"},
+                    headers={"X-Username": "bob"})
+    body = client.get("/posts",
+                      params={"username": "alice", "q": "keep", "limit": 2}).json()
+    assert len(body) == 2
+    assert all(p["username"] == "alice" for p in body)
+    assert all("keep" in p["message"] for p in body)

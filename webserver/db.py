@@ -82,18 +82,25 @@ def init_db() -> None:
     """
     Create tables if they don't exist.
 
-    SCHEMA
-    ──────
+    SCHEMA (silver)
+    ───────────────
       users
         id          INTEGER  primary key, auto-increment
         username    TEXT     unique, not null
         created_at  TEXT     ISO-8601 "YYYY-MM-DDTHH:MM:SS"
+        bio         TEXT     nullable (silver)
 
       posts
         id          INTEGER  primary key, auto-increment
         user_id     INTEGER  foreign key → users.id, not null
         message     TEXT     not null
         created_at  TEXT     ISO-8601 "YYYY-MM-DDTHH:MM:SS"
+        updated_at  TEXT     nullable; set by PATCH /posts/{id} (silver)
+
+      (post_count is NOT a column — it is computed per-request from
+       a correlated subquery `SELECT COUNT(*) FROM posts WHERE user_id = u.id`.
+       Storing it would require keeping a counter in sync on every
+       post INSERT/DELETE, and drift bugs are common.  Compute it.)
 
     DIFFERENCES FROM A1
     ───────────────────
@@ -117,7 +124,8 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS users (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 username    TEXT    NOT NULL UNIQUE,
-                created_at  TEXT    NOT NULL
+                created_at  TEXT    NOT NULL,
+                bio         TEXT
             )
         """)
         conn.execute("""
@@ -125,6 +133,7 @@ def init_db() -> None:
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id     INTEGER NOT NULL REFERENCES users(id),
                 message     TEXT    NOT NULL,
-                created_at  TEXT    NOT NULL
+                created_at  TEXT    NOT NULL,
+                updated_at  TEXT
             )
         """)

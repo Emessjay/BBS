@@ -1,5 +1,5 @@
 """
-main.py — FastAPI BBS webserver (Assignment 2, bronze tier).
+main.py — FastAPI BBS webserver (Assignment 2, silver tier).
 
 READING GUIDE
 ─────────────
@@ -7,35 +7,45 @@ This file has four layers, top to bottom:
 
   1. Lifespan + app setup    — runs init_db() on startup.
   2. Pydantic models         — request validation (UserCreate,
-                               PostCreate) and response shape lockdown
-                               (UserOut, PostOut).
-  3. Row → dict helpers      — translate sqlite3.Row objects into the
-                               exact-shape dicts the spec requires.
-  4. Route handlers          — one function per endpoint, grouped by
-                               resource.  Raw SQL (no ORM) because
-                               A1 used raw SQL too and the schema
-                               is small enough that the extra
-                               machinery would obscure the logic.
+                               PostCreate, UserPatch, PostPatch) and
+                               response shape lockdown (UserOut, PostOut).
+  3. Row → dict helpers + SQL fragments kept in one place.
+  4. Route handlers, grouped by resource.  Raw SQL (no ORM) because
+     the schema is small enough that ORM machinery would obscure
+     the logic.
 
 WHY PYDANTIC MODELS FOR BOTH REQUESTS AND RESPONSES
 ────────────────────────────────────────────────────
-The spec says response bodies must contain EXACTLY the listed fields
-— no extras, no omissions.  The naive implementation is to return
-`dict(row)` straight from SQLite, which leaks internal columns like
-`user_id`.  By declaring a `response_model=UserOut` (or PostOut) on
+The spec says response bodies must contain EXACTLY the listed fields.
+The naive implementation — returning dict(row) straight from SQLite —
+leaks internal columns like user_id.  By declaring response_model on
 each route, FastAPI filters the outgoing dict against the model's
 fields before serialising.  Any stray field silently drops; any
-missing field raises a server error that surfaces in tests.  That
-gives us field-shape correctness for free.
+missing field raises a server error that surfaces in tests.  Field-
+shape correctness comes for free.
 
 WHY RAW SQL INSTEAD OF AN ORM
 ──────────────────────────────
 SQLAlchemy would add 200+ lines of boilerplate for a schema with two
-tables and seven queries.  Raw SQL parameterised with `?` is safe
-against injection (sqlite3 binds values properly), readable, and
-mirrors A1's teaching so students can trace from one assignment to
-the next.  Silver/gold tiers are where the ORM starts paying for
-itself — not here.
+tables and a handful of queries.  Raw SQL parameterised with `?` is
+safe against injection (the sqlite3 driver binds values properly),
+readable, and mirrors A1's teaching so students can trace from one
+assignment to the next.  Silver's correlated subquery for post_count
+is three lines of SQL; hiding it inside an ORM relationship would
+just cost an extra query per user.
+
+SILVER IN ONE PARAGRAPH
+───────────────────────
+Silver expands user responses with `bio` (nullable, editable via
+PATCH) and `post_count` (always computed from the posts table, never
+stored).  Post responses gain `updated_at` (null until the first
+PATCH).  Two new handlers: PATCH /users/{username} sets bio; PATCH
+/posts/{id} sets message and bumps updated_at.  GET /posts gains a
+`?username=` filter that composes with `?q=`, `?limit=`, and
+`?offset=`.  The PATCH on posts enforces an ownership policy —
+the X-Username header must match the post's author, or we return
+403.  That's "ownership option A" from the spec; the rationale is
+in the README.
 """
 
 from contextlib import asynccontextmanager
@@ -54,13 +64,9 @@ from db import get_db, init_db
 # ──────────────────────────────────────────────────────────────────────
 #
 # FastAPI runs this async context manager around the app's lifetime:
-# code before `yield` executes on startup; code after `yield` executes
-# on shutdown.  We use it to call init_db() so the schema is ready
-# before the first request arrives.
-#
-# TestClient(app) as a context manager triggers this same lifespan,
-# which is why every fresh test DB gets its tables created
-# automatically (no manual setup in conftest.py).
+# code before `yield` runs on startup, code after runs on shutdown.
+# TestClient(app) as a context manager triggers the same lifespan —
+# that is how every per-test tmp DB gets its schema created.
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
@@ -70,105 +76,180 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="BBS Webserver", lifespan=lifespan)
 
 
-# ──────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════
 #  Pydantic models
-# ──────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════
 #
-# Incoming models validate request bodies.  If validation fails,
-# FastAPI returns 422 with the Pydantic error detail — we do not
-# have to write that plumbing ourselves.
-#
-# Outgoing models (UserOut, PostOut) are what response_model= hooks
-# into to filter the shape of what we return.  Declaring them
-# explicitly is the single most effective way to stop database
-# columns from leaking into the public API.
+# Incoming models validate request bodies.  Outgoing models filter
+# the response shape.  Keep them in one place so the spec changes
+# feel self-contained.
 
 class UserCreate(BaseModel):
     """Body for POST /users."""
-    # Field(..., min_length=..., max_length=..., pattern=...) generates
-    # the exact validation rules listed in the assignment:
-    #   - 3 to 20 chars
-    #   - regex ^[a-zA-Z0-9_]+$
-    # The "..." sentinel means "required" (Pydantic v2 idiom).
+    # Field(..., pattern=...) rejects anything outside the spec's
+    # character class.  The trailing "..." sentinel means "required"
+    # (Pydantic v2 idiom).
     username: str = Field(..., min_length=3, max_length=20,
                           pattern=r"^[a-zA-Z0-9_]+$")
 
 
 class PostCreate(BaseModel):
     """Body for POST /posts."""
-    # min_length=1 catches the empty-message case; max_length=500 is
-    # the spec cap.  Both failures produce 422.
     message: str = Field(..., min_length=1, max_length=500)
 
 
+class UserPatch(BaseModel):
+    """
+    Body for PATCH /users/{username}.
+
+    Only one field today (bio).  The type is `str | None`, the
+    default is None, and the field is optional — three things that
+    together give us the three PATCH behaviours we need:
+
+      body {"bio": "hi"}   → update bio to "hi"
+      body {"bio": null}   → clear bio back to null
+      body {}              → no-op (field is absent from model_dump(exclude_unset=True))
+
+    Unknown keys silently drop (Pydantic v2 defaults to extra='ignore'),
+    so a forward-looking client that ships a future "avatar" field
+    does not break on today's server.
+    """
+    bio: Optional[str] = Field(default=None, max_length=200)
+
+
+class PostPatch(BaseModel):
+    """
+    Body for PATCH /posts/{id}.
+
+    Same three-behaviour pattern as UserPatch, except:
+
+      body {"message": "new"}  → update message
+      body {"message": null}   → 422 (handled in the handler — a
+                                  null message is nonsensical; the
+                                  validator can't tell null-set from
+                                  null-unset at this layer)
+      body {}                  → no-op, updated_at left untouched
+
+    min_length=1 here means "if message IS a string, it must be non-empty".
+    It does not reject None — that check happens in the handler.
+    """
+    message: Optional[str] = Field(default=None, min_length=1, max_length=500)
+
+
 class UserOut(BaseModel):
-    """What /users endpoints return.  Exactly two fields — no more."""
+    """
+    Silver user response.  Exactly four fields — enforced by
+    response_model on every /users endpoint.
+    """
     username: str
     created_at: str
+    bio: Optional[str] = None
+    post_count: int
 
 
 class PostOut(BaseModel):
-    """What /posts endpoints return.  Exactly four fields."""
+    """
+    Silver post response.  Exactly five fields.  updated_at is null
+    for posts that have never been PATCHed.
+    """
     id: int
     username: str
     message: str
     created_at: str
+    updated_at: Optional[str] = None
 
 
-# ──────────────────────────────────────────────────────────────────────
-#  Time & row helpers
-# ──────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════
+#  SQL fragments, time helpers, row adapters
+# ══════════════════════════════════════════════════════════════════════
+#
+# The user SELECT is used by POST, GET one, GET list, and PATCH —
+# four places.  Pulling it into a constant means a single change to
+# the silver shape does not require touching four query strings.
+
+_USER_SELECT = """
+SELECT u.username,
+       u.created_at,
+       u.bio,
+       (SELECT COUNT(*) FROM posts p WHERE p.user_id = u.id) AS post_count
+  FROM users u
+"""
+
+_POST_SELECT = """
+SELECT p.id,
+       u.username,
+       p.message,
+       p.created_at,
+       p.updated_at
+  FROM posts p
+  JOIN users u ON u.id = p.user_id
+"""
+
 
 def _now_iso() -> str:
     """
     Current UTC time in the spec's format: YYYY-MM-DDTHH:MM:SS.
 
-    We strip the tzinfo so isoformat() does not append "+00:00" — the
-    spec's example shows no timezone suffix, and adding one would
-    cause the verifier's regex-style assertions to fail.
+    Strip tzinfo so isoformat() does not append "+00:00".
     """
     return datetime.now(timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds")
 
 
 def _row_to_user(row: sqlite3.Row) -> dict:
     """
-    Turn a `users` row into a UserOut-shaped dict.
+    Turn a users-with-post_count row into a UserOut-shaped dict.
 
-    Called explicitly (instead of returning `dict(row)`) because
-    `dict(row)` would include `id`, which is NOT in the public user
-    shape.  One line here is cheaper than a mystery field leak.
-    """
-    return {"username": row["username"], "created_at": row["created_at"]}
-
-
-def _row_to_post(row: sqlite3.Row) -> dict:
-    """
-    Turn a joined posts + users row into a PostOut-shaped dict.
-
-    Expects the query to SELECT p.id, u.username, p.message,
-    p.created_at (in any order) so the column names line up with
-    the PostOut model.
+    Uses dict-literal construction (not dict(row)) because dict(row)
+    would include the internal `id` column.  Explicit is safer.
     """
     return {
-        "id": row["id"],
-        "username": row["username"],
-        "message": row["message"],
+        "username":   row["username"],
         "created_at": row["created_at"],
+        "bio":        row["bio"],
+        "post_count": row["post_count"],
     }
 
 
-# ──────────────────────────────────────────────────────────────────────
+def _row_to_post(row: sqlite3.Row) -> dict:
+    """Turn a posts-join-users row into a PostOut-shaped dict."""
+    return {
+        "id":         row["id"],
+        "username":   row["username"],
+        "message":    row["message"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def _fetch_user(conn, username: str):
+    """Load one user in full silver shape, or None if missing."""
+    return conn.execute(
+        _USER_SELECT + " WHERE u.username = ?",
+        (username,),
+    ).fetchone()
+
+
+def _fetch_post(conn, post_id: int):
+    """Load one post in full silver shape, or None if missing."""
+    return conn.execute(
+        _POST_SELECT + " WHERE p.id = ?",
+        (post_id,),
+    ).fetchone()
+
+
+# ══════════════════════════════════════════════════════════════════════
 #  /users
-# ──────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════
 
 @app.post("/users", status_code=status.HTTP_201_CREATED, response_model=UserOut)
 def create_user(body: UserCreate):
     """
     Create a new user.
 
-    Returns 201 on success, 409 if the username is already taken,
-    422 if the username fails validation (handled by Pydantic before
-    this function even runs).
+    201 on success, 409 on duplicate username, 422 on validation
+    failure (handled by Pydantic before we get here).  A freshly-
+    created user has bio=null and post_count=0 by construction —
+    no DB round trip needed for that.
     """
     created_at = _now_iso()
     try:
@@ -178,34 +259,33 @@ def create_user(body: UserCreate):
                 (body.username, created_at),
             )
     except sqlite3.IntegrityError:
-        # UNIQUE constraint violation on the username column.  That
-        # is the ONLY IntegrityError we expect here — any other
-        # integrity error is a bug, not a user-facing 409.
+        # UNIQUE constraint on username.  That is the only
+        # IntegrityError we expect here; any other is a real bug.
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"username '{body.username}' already exists",
         )
-    return {"username": body.username, "created_at": created_at}
+    return {
+        "username": body.username,
+        "created_at": created_at,
+        "bio": None,
+        "post_count": 0,
+    }
 
 
 @app.get("/users", response_model=list[UserOut])
 def list_users():
-    """List every user.  Returns [] (NOT 404) when there are none."""
+    """List every user in the silver shape.  [] when empty (not 404)."""
     with get_db() as conn:
-        rows = conn.execute(
-            "SELECT username, created_at FROM users ORDER BY id"
-        ).fetchall()
+        rows = conn.execute(_USER_SELECT + " ORDER BY u.id").fetchall()
     return [_row_to_user(r) for r in rows]
 
 
 @app.get("/users/{username}", response_model=UserOut)
 def get_user(username: str):
-    """Look up one user by username.  404 if they do not exist."""
+    """Look up one user.  404 if missing."""
     with get_db() as conn:
-        row = conn.execute(
-            "SELECT username, created_at FROM users WHERE username = ?",
-            (username,),
-        ).fetchone()
+        row = _fetch_user(conn, username)
     if row is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -214,18 +294,51 @@ def get_user(username: str):
     return _row_to_user(row)
 
 
+@app.patch("/users/{username}", response_model=UserOut)
+def update_user(username: str, body: UserPatch):
+    """
+    PATCH semantics:
+      - {"bio": "x"} → sets bio to "x"
+      - {"bio": null} → clears bio (sets to NULL)
+      - {} → no-op; returns current state with 200
+
+    Unknown fields in the body are ignored (Pydantic's default).
+
+    We always re-read and return the full silver shape so the
+    response reflects the saved state, not the request.  That makes
+    the endpoint safe to retry and gives the client post_count too.
+    """
+    # model_dump(exclude_unset=True) is the one incantation that
+    # distinguishes "field absent" from "field present with value
+    # None".  Any field in `updates` was explicitly sent by the
+    # client; missing fields stay absent.
+    updates = body.model_dump(exclude_unset=True)
+
+    with get_db() as conn:
+        existing = conn.execute(
+            "SELECT id FROM users WHERE username = ?", (username,)
+        ).fetchone()
+        if existing is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"user '{username}' not found",
+            )
+        if "bio" in updates:
+            conn.execute(
+                "UPDATE users SET bio = ? WHERE id = ?",
+                (updates["bio"], existing["id"]),
+            )
+        row = _fetch_user(conn, username)
+    return _row_to_user(row)
+
+
 @app.get("/users/{username}/posts", response_model=list[PostOut])
 def list_user_posts(username: str):
     """
     All posts by one user.
 
-    Two cases to distinguish:
-      - user does not exist       → 404
-      - user exists, has no posts → 200 with []
-
-    We do a cheap existence check first, then the join.  The
-    alternative (one query with LEFT JOIN) conflates the two cases
-    and makes it harder to return the right status code.
+    Distinguish "user does not exist" (404) from "user exists, no
+    posts" (200 []) with a cheap existence check before the join.
     """
     with get_db() as conn:
         exists = conn.execute(
@@ -237,46 +350,29 @@ def list_user_posts(username: str):
                 detail=f"user '{username}' not found",
             )
         rows = conn.execute(
-            """
-            SELECT p.id, u.username, p.message, p.created_at
-              FROM posts p
-              JOIN users u ON u.id = p.user_id
-             WHERE u.username = ?
-             ORDER BY p.id
-            """,
+            _POST_SELECT + " WHERE u.username = ? ORDER BY p.id",
             (username,),
         ).fetchall()
     return [_row_to_post(r) for r in rows]
 
 
-# ──────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════
 #  /posts
-# ──────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════
 
 @app.post("/posts", status_code=status.HTTP_201_CREATED, response_model=PostOut)
 def create_post(
     body: PostCreate,
-    # Header(default=None, alias="X-Username") means:
-    #   - missing header  → x_username is None
-    #   - empty header    → x_username is ""
-    # Both cases are treated as "client forgot to send identity" and
-    # produce 400 below.  We intentionally do NOT use the Pydantic
-    # pattern=... validator on this header, because a malformed
-    # X-Username should become a 400 or 404 (per spec), not 422.
     x_username: Optional[str] = Header(default=None, alias="X-Username"),
 ):
     """
-    Create a post on behalf of the user named in X-Username.
+    Create a post on behalf of X-Username.
 
-    Status codes:
-      201 — created
-      400 — missing or empty X-Username header
-      404 — X-Username names a user that does not exist
-      422 — message fails validation (Pydantic)
+    400 — header missing or empty
+    404 — header names an unknown user
+    422 — message validation fails (Pydantic)
+    201 — OK; response updated_at is null (nothing's been edited yet)
     """
-    # Missing OR empty header → 400.  Empty string is treated the
-    # same as missing because it cannot possibly be a valid username
-    # and the "client bug" framing is clearer than "user not found".
     if not x_username:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -289,8 +385,6 @@ def create_post(
             "SELECT id FROM users WHERE username = ?", (x_username,)
         ).fetchone()
         if user_row is None:
-            # A2 schema change: we do NOT auto-create the user here.
-            # A1 used INSERT OR IGNORE and silently created unknowns.
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"user '{x_username}' not found",
@@ -306,6 +400,7 @@ def create_post(
         "username": x_username,
         "message": body.message,
         "created_at": created_at,
+        "updated_at": None,
     }
 
 
@@ -316,45 +411,49 @@ def list_posts(
     q: Optional[str] = Query(default=None),
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
+    # Silver: filter by author.  No pattern= here because the
+    # filter semantics for an unknown/malformed username is "return
+    # [] (no matches)", not "422 because your filter string has a
+    # dash".  Cleaner to let any string flow through.
+    username: Optional[str] = Query(default=None),
 ):
     """
-    List posts, newest first, with optional substring search.
+    List posts, newest first, with optional substring search and
+    optional author filter.
 
-    ?q=foo        filters to posts whose message contains "foo"
-                  (case-insensitive, `%` and `_` treated literally).
-    ?limit=N      returns at most N (1-200, default 50).
-    ?offset=K     skips the first K (>= 0, default 0).
+    ?q=foo         — message contains "foo" (literal, LIKE wildcards
+                     escaped; case-insensitive via SQLite's default
+                     LIKE behaviour).
+    ?username=X    — posts by author X only (silver).  Unknown or
+                     malformed X → [].  Composes with all other
+                     filters (intersection).
+    ?limit=N       — cap results at N (1-200, default 50).
+    ?offset=K      — skip first K (>= 0, default 0).
     """
-    # The SQL below is interesting for three reasons:
-    #
-    # 1. We ORDER BY p.id DESC so "newest first" matches a typical
-    #    feed's expectation.  limit/offset make no sense without a
-    #    stable order.
-    #
-    # 2. For search, we use LIKE with '%' concatenation — but we
-    #    ESCAPE the user's q first.  SQL LIKE treats '%' and '_'
-    #    as wildcards by default; if the user searches for "50%",
-    #    without escaping that becomes a prefix match on "50".
-    #    The ESCAPE '\' clause tells SQLite to treat \% and \_ as
-    #    literals.
-    #
-    # 3. LIKE is case-insensitive for ASCII in SQLite by default,
-    #    which happens to match A1's search behaviour.  Good; it
-    #    keeps semantics consistent between CLI and API.
-
-    sql = """
-        SELECT p.id, u.username, p.message, p.created_at
-          FROM posts p
-          JOIN users u ON u.id = p.user_id
-    """
+    # Build the query out of a base SELECT + an AND-joined list of
+    # WHERE clauses.  Keeping params in lock-step with the clauses
+    # makes it easy to add more filters later (gold tier: ?board=).
+    sql = _POST_SELECT
+    where: list[str] = []
     params: list = []
+
     if q is not None:
-        # Escape backslashes first (so they stay literal in SQL),
-        # then the two LIKE wildcards.
+        # SQL LIKE: '%' and '_' are wildcards.  If the user searches
+        # for "50%", we want a literal-substring match, not a prefix
+        # match on "50".  Escape backslash first (so it stays literal
+        # in the SQL text), then the two LIKE wildcards.
         escaped = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-        sql += " WHERE p.message LIKE ? ESCAPE '\\' "
+        where.append("p.message LIKE ? ESCAPE '\\' ")
         params.append(f"%{escaped}%")
 
+    if username is not None:
+        # Equality filter.  Exact match, case-sensitive — consistent
+        # with how usernames are stored and compared everywhere else.
+        where.append("u.username = ?")
+        params.append(username)
+
+    if where:
+        sql += " WHERE " + " AND ".join(where)
     sql += " ORDER BY p.id DESC LIMIT ? OFFSET ? "
     params.extend([limit, offset])
 
@@ -365,17 +464,9 @@ def list_posts(
 
 @app.get("/posts/{post_id}", response_model=PostOut)
 def get_post(post_id: int):
-    """One post by id.  404 if it does not exist."""
+    """One post by id.  404 if missing."""
     with get_db() as conn:
-        row = conn.execute(
-            """
-            SELECT p.id, u.username, p.message, p.created_at
-              FROM posts p
-              JOIN users u ON u.id = p.user_id
-             WHERE p.id = ?
-            """,
-            (post_id,),
-        ).fetchone()
+        row = _fetch_post(conn, post_id)
     if row is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -384,14 +475,85 @@ def get_post(post_id: int):
     return _row_to_post(row)
 
 
+@app.patch("/posts/{post_id}", response_model=PostOut)
+def update_post(
+    post_id: int,
+    body: PostPatch,
+    x_username: Optional[str] = Header(default=None, alias="X-Username"),
+):
+    """
+    Edit a post's message.  Ownership is enforced — only the post's
+    original author (as stored on the row) can edit it, and that
+    identity is claimed via the X-Username header.
+
+    Order of checks (matters for the response code):
+      400 — X-Username missing or empty
+      404 — post does not exist
+      403 — post exists but X-Username does not match the author
+      422 — body fails validation (Pydantic) OR explicit null message
+      200 — OK (includes {} no-op case, which leaves updated_at alone)
+
+    The 404-before-403 ordering means an unknown post id always
+    looks the same to any caller, regardless of whether they own it.
+    That is the plain-REST default; a security-hardened build might
+    flip this to 403-everywhere to avoid leaking whether an id
+    exists, but bronze is not worried about that.
+    """
+    if not x_username:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="X-Username header is required",
+        )
+
+    updates = body.model_dump(exclude_unset=True)
+    # Reject an explicit null message here rather than at validation
+    # time, because Pydantic's min_length=1 constraint does not fire
+    # on None (the value short-circuits the string check).  We want
+    # null to count as a 422, so we raise one manually.
+    if "message" in updates and updates["message"] is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="message cannot be null",
+        )
+
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT p.id, u.username "
+            "  FROM posts p "
+            "  JOIN users u ON u.id = p.user_id "
+            " WHERE p.id = ?",
+            (post_id,),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"post {post_id} not found",
+            )
+        if row["username"] != x_username:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="you can only edit your own posts",
+            )
+
+        if "message" in updates:
+            # Only touch updated_at when we actually changed
+            # something.  A no-op PATCH ({}) leaves updated_at alone.
+            conn.execute(
+                "UPDATE posts SET message = ?, updated_at = ? WHERE id = ?",
+                (updates["message"], _now_iso(), post_id),
+            )
+
+        post_row = _fetch_post(conn, post_id)
+    return _row_to_post(post_row)
+
+
 @app.delete("/posts/{post_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_post(post_id: int):
     """
-    Hard-delete a post by id.
+    Hard-delete a post.  204 on success, 404 if missing.
 
-    Returns 204 (no body) on success, 404 if the id does not exist.
-    We check rowcount after the DELETE instead of a SELECT-then-
-    DELETE because that would be two round trips and a race.
+    Check rowcount after the DELETE instead of SELECT-then-DELETE:
+    one round trip, no race.
     """
     with get_db() as conn:
         cursor = conn.execute("DELETE FROM posts WHERE id = ?", (post_id,))
@@ -400,7 +562,7 @@ def delete_post(post_id: int):
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"post {post_id} not found",
             )
-    # A 204 response MUST have an empty body.  FastAPI's default is
-    # to serialise `None` as `"null"`, which is NOT empty.  Returning
-    # an explicit empty Response sidesteps that gotcha.
+    # 204 must have an empty body.  FastAPI would serialise `None`
+    # as the string "null", which is a byte of body.  Returning an
+    # explicit empty Response guarantees zero bytes.
     return Response(status_code=status.HTTP_204_NO_CONTENT)
