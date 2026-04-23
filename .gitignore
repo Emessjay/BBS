@@ -1,0 +1,24 @@
+# Virtual environments
+.venv/
+venv/
+
+# SQLite databases (runtime state, not source)
+*.db
+bbs_backup_*.db
+
+# JSON storage for the A1 CLI (runtime state)
+bbs.json
+
+# Python bytecode and caches
+__pycache__/
+*.pyc
+*.pyo
+
+# pytest / tooling caches
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Editor / OS cruft
+.DS_Store
+*.swp
