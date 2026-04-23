@@ -1,5 +1,5 @@
 """
-main.py — FastAPI BBS webserver (Assignment 2, silver tier).
+main.py — FastAPI BBS webserver (Assignment 2, gold tier).
 
 READING GUIDE
 ─────────────
@@ -7,9 +7,10 @@ This file has four layers, top to bottom:
 
   1. Lifespan + app setup    — runs init_db() on startup.
   2. Pydantic models         — request validation (UserCreate,
-                               PostCreate, UserPatch, PostPatch) and
-                               response shape lockdown (UserOut, PostOut).
-  3. Row → dict helpers + SQL fragments kept in one place.
+                               PostCreate, UserPatch, PostPatch,
+                               BoardPostCreate) and response shape
+                               lockdown (UserOut, PostOut, BoardOut).
+  3. Row → dict helpers + SQL fragments + the shared _insert_post().
   4. Route handlers, grouped by resource.  Raw SQL (no ORM) because
      the schema is small enough that ORM machinery would obscure
      the logic.
@@ -34,18 +35,26 @@ assignment to the next.  Silver's correlated subquery for post_count
 is three lines of SQL; hiding it inside an ORM relationship would
 just cost an extra query per user.
 
-SILVER IN ONE PARAGRAPH
-───────────────────────
-Silver expands user responses with `bio` (nullable, editable via
-PATCH) and `post_count` (always computed from the posts table, never
-stored).  Post responses gain `updated_at` (null until the first
-PATCH).  Two new handlers: PATCH /users/{username} sets bio; PATCH
-/posts/{id} sets message and bumps updated_at.  GET /posts gains a
-`?username=` filter that composes with `?q=`, `?limit=`, and
-`?offset=`.  The PATCH on posts enforces an ownership policy —
-the X-Username header must match the post's author, or we return
-403.  That's "ownership option A" from the spec; the rationale is
-in the README.
+TIER RECAP (read top-to-bottom for the evolution)
+──────────────────────────────────────────────────
+Bronze
+  8 endpoints: CRUD-ish on /users and /posts.  Hard delete.
+  X-Username header for identity on POST /posts (not auth).
+  Field shapes: user={username, created_at}; post={id, username,
+  message, created_at}.
+Silver
+  User responses gain `bio` (nullable, editable) and `post_count`
+  (computed, never stored).  Post responses gain `updated_at` (null
+  until the first PATCH).  New: PATCH /users/{username} (bio),
+  PATCH /posts/{id} (message, ownership-enforced via X-Username),
+  and GET /posts?username=X filter.
+Gold
+  Posts gain `board` (NOT NULL DEFAULT 'general').  New endpoints:
+  GET /boards, GET /boards/{name}/posts, POST /boards/{name}/posts
+  (URL-authoritative; body cannot carry `board`).  GET /posts gains
+  a `?board=` filter that composes with the other filters.  Boards
+  are implicit — no `boards` table — and exist as long as any post
+  references them.
 """
 
 from contextlib import asynccontextmanager
@@ -57,6 +66,22 @@ from fastapi import FastAPI, HTTPException, Header, Path, Query, Response, statu
 from pydantic import BaseModel, Field
 
 from db import get_db, init_db
+
+
+# ──────────────────────────────────────────────────────────────────────
+#  Shared validation constants
+# ──────────────────────────────────────────────────────────────────────
+#
+# Usernames and board names happen to share the same character class
+# (letters, digits, underscores).  They have different length limits
+# — usernames are 3–20 per the spec, board names we cap at 32 — so
+# the PATTERN is shared but the `max_length`/`min_length` bounds are
+# set per-caller.
+#
+# Defining the pattern in one place means a change to what we
+# consider "identifier-safe" (e.g. adding hyphen) is a one-line edit
+# that propagates to every Field/Path that references it.
+_IDENT_RE = r"^[a-zA-Z0-9_]+$"
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -86,11 +111,12 @@ app = FastAPI(title="BBS Webserver", lifespan=lifespan)
 
 class UserCreate(BaseModel):
     """Body for POST /users."""
-    # Field(..., pattern=...) rejects anything outside the spec's
+    # Field(..., pattern=...) rejects anything outside the identifier
     # character class.  The trailing "..." sentinel means "required"
-    # (Pydantic v2 idiom).
+    # (Pydantic v2 idiom).  _IDENT_RE is module-level so the regex is
+    # defined once and shared with board-name validation.
     username: str = Field(..., min_length=3, max_length=20,
-                          pattern=r"^[a-zA-Z0-9_]+$")
+                          pattern=_IDENT_RE)
 
 
 class PostCreate(BaseModel):
@@ -109,7 +135,7 @@ class PostCreate(BaseModel):
     """
     message: str = Field(..., min_length=1, max_length=500)
     board: str = Field(default="general",
-                       pattern=r"^[a-zA-Z0-9_]+$",
+                       pattern=_IDENT_RE,
                        max_length=32)
 
 
@@ -628,6 +654,21 @@ def update_post(
             )
 
         post_row = _fetch_post(conn, post_id)
+
+    # Defensive None-check: _fetch_post could in principle return
+    # None if the post vanished between the existence check above
+    # and this re-read.  Under single-worker uvicorn + SQLite's
+    # connection-level locking, this is functionally impossible
+    # (the whole `with get_db()` runs on one connection that holds
+    # the transaction until commit).  But the guard costs nothing
+    # and converts a crash-with-500 into a clean 404 if the
+    # impossible ever becomes possible (e.g. we ever add multi-
+    # worker deployment, or someone bypasses the get_db helper).
+    if post_row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"post {post_id} not found",
+        )
     return _row_to_post(post_row)
 
 
@@ -641,12 +682,12 @@ def update_post(
 # when "foo" has never been posted to returns 200 [] — same FILTER
 # semantics we used for ?username= in silver.
 
-# Pydantic does not validate FastAPI path parameters with the same
-# Field(pattern=...) machinery it uses for body fields, so we pass
-# the regex directly to Path().  The effect is the same: a malformed
-# {name} in the URL → 422 from the validation layer, before any
-# handler code runs.
-_BOARD_PATTERN = r"^[a-zA-Z0-9_]+$"
+# Path() with pattern= and max_length= validates path parameters
+# through the same Pydantic machinery that Field() uses for body
+# fields.  A malformed {name} in the URL produces a 422 before any
+# handler code runs, identical to body-field validation.  Reusing
+# _IDENT_RE here keeps board-name-shape locked to user-name-shape
+# (they have the same character class; only length differs).
 
 
 @app.get("/boards", response_model=list[BoardOut])
@@ -673,7 +714,7 @@ def list_boards():
 
 @app.get("/boards/{name}/posts", response_model=list[PostOut])
 def list_board_posts(
-    name: str = Path(..., pattern=_BOARD_PATTERN, max_length=32),
+    name: str = Path(..., pattern=_IDENT_RE, max_length=32),
 ):
     """
     List posts on a single board, in the same DESC-id order as
@@ -693,7 +734,7 @@ def list_board_posts(
           response_model=PostOut)
 def create_board_post(
     body: BoardPostCreate,
-    name: str = Path(..., pattern=_BOARD_PATTERN, max_length=32),
+    name: str = Path(..., pattern=_IDENT_RE, max_length=32),
     x_username: Optional[str] = Header(default=None, alias="X-Username"),
 ):
     """

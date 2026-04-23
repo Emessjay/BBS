@@ -109,22 +109,30 @@ def init_db() -> None:
       reserve an empty board — if that's ever needed, add a `boards`
       table later and backfill from the distinct set of post boards.
 
-    DIFFERENCES FROM A1
-    ───────────────────
-      - A1 had one table per board (board_general, board_tech, ...).
-        A2 flattens that into a single `posts` table.  Boards are a
-        gold-tier feature; bronze ignores them.
-      - A1 stored an optional password_hash on users.  The A2 API
-        has no concept of passwords (and X-Username is explicitly
-        not authentication), so that column is gone.
-      - A1's insert-post path ran INSERT OR IGNORE on users, which
-        auto-created unknown posters.  A2 drops that behaviour —
-        unknown users cause POST /posts to return 404.  We enforce
-        that in main.py, not here, because the DB layer has no
-        opinion on status codes.
+    DIFFERENCES FROM A1 (after the refactor)
+    ────────────────────────────────────────
+      - A1 carries a password_hash column on users and supports
+        register/login commands.  A2's API has no concept of
+        passwords — X-Username is explicitly not authentication —
+        so that column is gone.
+      - A1 uses `timestamp` on posts; A2 renames it to `created_at`
+        to match the JSON field name the spec mandates in responses.
+        A2 also gains an `updated_at` column (silver, nullable) for
+        PATCH and loses nothing.
+      - A1's insert-post path runs INSERT OR IGNORE on users, so
+        posting as an unknown name silently creates the account.
+        A2 drops that behaviour: POST /posts with an unknown
+        X-Username returns 404.  Enforcement lives in main.py,
+        not here — the DB layer has no opinion on status codes.
+      - Both files now use a flat `posts` table with a `board`
+        column (the old table-per-board design in A1 was reworked in
+        an earlier review round).  A2 adds indexes on
+        posts.user_id and posts.board; A1 does not, because its CLI
+        doesn't have the hot read paths (correlated subquery per
+        user, GROUP BY on every boards list) that the webserver does.
 
-    CREATE TABLE IF NOT EXISTS is idempotent, so it is safe to call
-    init_db() on every startup.
+    CREATE TABLE IF NOT EXISTS (and CREATE INDEX IF NOT EXISTS) are
+    idempotent, so it is safe to call init_db() on every startup.
     """
     with get_db() as conn:
         conn.execute("""
@@ -145,3 +153,17 @@ def init_db() -> None:
                 board       TEXT    NOT NULL DEFAULT 'general'
             )
         """)
+
+        # Indexes.  SQLite does NOT auto-index foreign-key columns,
+        # so without these two the correlated subquery used for
+        # UserOut.post_count (scans posts once per user) and the
+        # GET /posts?board= / GET /boards queries (scan posts once
+        # per request) degrade to O(N) table scans.  These indexes
+        # turn both into index lookups.  IF NOT EXISTS makes it safe
+        # to call init_db() on every startup.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_posts_user_id ON posts (user_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_posts_board ON posts (board)"
+        )

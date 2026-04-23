@@ -1607,3 +1607,286 @@ def test_gold_all_four_filters_compose(client, alice, bob):
         assert p["board"] == "tech"
         assert p["username"] == "alice"
         assert "keep" in p["message"]
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  ADVERSARIAL — edge cases the tier-specific sections miss
+# ══════════════════════════════════════════════════════════════════════
+#
+# These tests were added after a deliberate adversarial review.  Each
+# one targets a specific failure mode that a reasonable implementation
+# could ship without noticing — usually because of a Python or SQL
+# semantic quirk, not a spec ambiguity.  The test names spell out the
+# failure they prevent.
+
+# ── Search edge cases ────────────────────────────────────────────────
+
+def test_adversarial_q_empty_string_matches_everything(client, alice):
+    # ?q="" builds SQL `LIKE '%%' ESCAPE '\'` — SQLite treats that as
+    # "match any string", so the filter is effectively a no-op and
+    # every post comes back.  Documenting behavior so a future
+    # refactor does not accidentally make ""q"" mean "return []".
+    for i in range(3):
+        client.post("/posts", json={"message": f"m{i}"},
+                    headers={"X-Username": "alice"})
+    body = client.get("/posts", params={"q": ""}).json()
+    assert len(body) == 3
+
+
+def test_adversarial_q_literal_backslash_matches_backslash(client, alice):
+    # The escape dance in list_posts replaces `\` → `\\` BEFORE it
+    # replaces `%` and `_`.  If the order were reversed (or the `\`
+    # escape dropped), a message containing a literal backslash would
+    # either silently not match or blow up the LIKE pattern.
+    client.post("/posts", json={"message": r"path\to\file"},
+                headers={"X-Username": "alice"})
+    client.post("/posts", json={"message": "no slashes here"},
+                headers={"X-Username": "alice"})
+    body = client.get("/posts", params={"q": r"\to\f"}).json()
+    assert len(body) == 1
+    assert body[0]["message"] == r"path\to\file"
+
+
+def test_adversarial_q_mixed_literal_and_text(client, alice):
+    # "50%" must match the literal substring "50%" — NOT prefix-match
+    # any message starting with "50".  Catches a forgotten `%`
+    # escape.
+    client.post("/posts", json={"message": "50%off today"},
+                headers={"X-Username": "alice"})
+    client.post("/posts", json={"message": "50 percent off"},
+                headers={"X-Username": "alice"})
+    body = client.get("/posts", params={"q": "50%"}).json()
+    assert len(body) == 1
+    assert "50%off" in body[0]["message"]
+
+
+# ── Order-of-checks on PATCH /posts/{id} ─────────────────────────────
+
+def test_adversarial_patch_missing_header_beats_null_message(client, alice):
+    # Two error conditions at once.  400 (missing X-Username) must
+    # win over 422 (null message).  Pins the order-of-checks so a
+    # refactor that moves the header check to the bottom breaks
+    # loudly.
+    pid = client.post("/posts", json={"message": "x"},
+                      headers={"X-Username": "alice"}).json()["id"]
+    r = client.patch(f"/posts/{pid}", json={"message": None})
+    assert r.status_code == 400
+
+
+def test_adversarial_patch_missing_header_beats_missing_post(client):
+    # Header check must also beat the 404-on-missing-post check.
+    # A client with a malformed request (no identity) should get 400
+    # before we leak whether any particular id exists.
+    r = client.patch("/posts/99999999", json={"message": "x"})
+    assert r.status_code == 400
+
+
+def test_adversarial_patch_on_already_deleted_post_is_404(client, alice):
+    # PATCHing a deleted post must be 404 — not 500 from a stale
+    # in-memory reference, not 403 because "it still exists but you
+    # don't own it," and not 200 with a ghost row.
+    pid = client.post("/posts", json={"message": "x"},
+                      headers={"X-Username": "alice"}).json()["id"]
+    client.delete(f"/posts/{pid}")
+    r = client.patch(f"/posts/{pid}", json={"message": "y"},
+                     headers={"X-Username": "alice"})
+    assert r.status_code == 404
+
+
+# ── Pagination & path parameter edge cases ───────────────────────────
+
+def test_adversarial_very_large_offset_returns_empty(client, alice):
+    # Gigantic offset against a non-empty table must not crash and
+    # must not invent rows.  It's a filter that simply lands past
+    # the end.
+    client.post("/posts", json={"message": "x"},
+                headers={"X-Username": "alice"})
+    r = client.get("/posts", params={"offset": 999_999_999})
+    assert r.status_code == 200
+    assert r.json() == []
+
+
+def test_adversarial_delete_non_integer_id_returns_422(client):
+    # `/posts/{post_id}` types post_id as int.  A non-int path param
+    # is a validation failure at the routing layer — 422 before any
+    # handler runs.  If the route ever got typed as str we'd start
+    # 404ing instead, which is subtly wrong.
+    r = client.delete("/posts/not-a-number")
+    assert r.status_code == 422
+
+
+def test_adversarial_patch_non_integer_id_returns_422(client, alice):
+    # Same routing-layer check, but for PATCH.
+    r = client.patch("/posts/abc", json={"message": "x"},
+                     headers={"X-Username": "alice"})
+    assert r.status_code == 422
+
+
+# ── Filter semantics parity ──────────────────────────────────────────
+
+def test_adversarial_username_filter_is_case_sensitive(client):
+    # Store-time username comparisons are case-sensitive (SQLite
+    # UNIQUE default).  The ?username= filter uses `=` which is
+    # byte-wise — so "Alice" and "alice" must NOT cross-match.
+    # Catches a refactor that switches to LOWER() or COLLATE NOCASE.
+    client.post("/users", json={"username": "alice"})
+    client.post("/users", json={"username": "Alice"})
+    client.post("/posts", json={"message": "lower"},
+                headers={"X-Username": "alice"})
+    client.post("/posts", json={"message": "upper"},
+                headers={"X-Username": "Alice"})
+    lower = client.get("/posts", params={"username": "alice"}).json()
+    upper = client.get("/posts", params={"username": "Alice"}).json()
+    assert len(lower) == 1 and lower[0]["message"] == "lower"
+    assert len(upper) == 1 and upper[0]["message"] == "upper"
+
+
+def test_adversarial_board_filter_empty_string_returns_empty(client, alice):
+    # No post has board="" (schema NOT NULL + DEFAULT 'general' +
+    # regex rejects empty).  ?board= with empty value should return
+    # []  — a filter with no matches, not the entire list.
+    client.post("/posts", json={"message": "x"},
+                headers={"X-Username": "alice"})
+    body = client.get("/posts", params={"board": ""}).json()
+    assert body == []
+
+
+# ── Forward-compat: extra body fields are ignored ────────────────────
+
+def test_adversarial_post_users_ignores_extra_body_fields(client):
+    # Pydantic v2 defaults to extra='ignore'.  A client shipping a
+    # future "avatar" or "display_name" field should not crash
+    # today's server.  Also confirms POST /users cannot be used to
+    # sneak in a `bio` — bio is only set via PATCH.
+    r = client.post("/users", json={"username": "alice",
+                                     "bio": "injected",
+                                     "avatar": "x.png",
+                                     "post_count": 999})
+    assert r.status_code == 201
+    assert r.json()["bio"] is None
+    assert r.json()["post_count"] == 0
+
+
+def test_adversarial_post_posts_ignores_extra_body_fields(client, alice):
+    # Same forward-compat principle on POST /posts.  Also confirms
+    # the client cannot set updated_at via the create path.
+    r = client.post("/posts",
+                    json={"message": "hi", "updated_at": "injected",
+                          "id": 999, "arbitrary": "junk"},
+                    headers={"X-Username": "alice"})
+    assert r.status_code == 201
+    assert r.json()["updated_at"] is None
+    assert r.json()["id"] != 999   # server-assigned, not client-set
+
+
+def test_adversarial_patch_posts_ignores_extra_body_fields(client, alice):
+    # PATCH /posts must NOT allow sneaking in a board, username, or
+    # updated_at.  Only `message` is editable through this endpoint;
+    # everything else in the body is dropped silently.
+    pid = client.post("/posts", json={"message": "orig", "board": "tech"},
+                      headers={"X-Username": "alice"}).json()["id"]
+    r = client.patch(f"/posts/{pid}",
+                     json={"message": "new", "board": "hijack",
+                           "username": "mallory", "id": 42},
+                     headers={"X-Username": "alice"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["message"] == "new"
+    assert body["board"] == "tech"      # NOT "hijack"
+    assert body["username"] == "alice"  # NOT "mallory"
+    assert body["id"] == pid            # NOT 42
+
+
+# ── Type coercion guards (Pydantic v2) ───────────────────────────────
+
+def test_adversarial_message_as_int_returns_422(client, alice):
+    # Pydantic v2 in strict-JSON mode rejects a JSON number for a
+    # str-typed field.  Test that we're NOT running in lax mode
+    # where 42 would coerce to the string "42".
+    r = client.post("/posts", json={"message": 42},
+                    headers={"X-Username": "alice"})
+    assert r.status_code == 422
+
+
+def test_adversarial_message_as_bool_returns_422(client, alice):
+    # Same principle for booleans.
+    r = client.post("/posts", json={"message": True},
+                    headers={"X-Username": "alice"})
+    assert r.status_code == 422
+
+
+def test_adversarial_username_as_int_returns_422(client):
+    r = client.post("/users", json={"username": 12345})
+    assert r.status_code == 422
+
+
+# ── Gold: cross-board aggregates ─────────────────────────────────────
+
+def test_adversarial_post_count_aggregates_across_boards(client, alice):
+    # post_count is a global count per user, NOT scoped to any
+    # board.  Catches a refactor that adds `AND board = 'general'`
+    # to the correlated subquery.
+    client.post("/posts", json={"message": "a", "board": "tech"},
+                headers={"X-Username": "alice"})
+    client.post("/posts", json={"message": "b", "board": "music"},
+                headers={"X-Username": "alice"})
+    client.post("/posts", json={"message": "c"},   # default 'general'
+                headers={"X-Username": "alice"})
+    assert client.get("/users/alice").json()["post_count"] == 3
+
+
+def test_adversarial_boards_order_count_desc_name_asc(client, alice):
+    # Ordering contract: busiest first (count DESC), alphabetical
+    # tiebreak (name ASC).  Pinning this means a UI that relies on
+    # the order does not break on a refactor.
+    for i in range(3):
+        client.post("/posts", json={"message": f"t{i}", "board": "tech"},
+                    headers={"X-Username": "alice"})
+    # Two boards each with one post — should tiebreak alphabetically.
+    client.post("/posts", json={"message": "m", "board": "music"},
+                headers={"X-Username": "alice"})
+    client.post("/posts", json={"message": "a", "board": "art"},
+                headers={"X-Username": "alice"})
+    names = [b["name"] for b in client.get("/boards").json()]
+    assert names == ["tech", "art", "music"]
+
+
+def test_adversarial_patch_does_not_change_user_post_count(client, alice):
+    # Post_count counts posts.  PATCHing a post's message must not
+    # incidentally change it.
+    client.post("/posts", json={"message": "a"}, headers={"X-Username": "alice"})
+    pid = client.post("/posts", json={"message": "b"},
+                      headers={"X-Username": "alice"}).json()["id"]
+    assert client.get("/users/alice").json()["post_count"] == 2
+    client.patch(f"/posts/{pid}", json={"message": "b-edited"},
+                 headers={"X-Username": "alice"})
+    assert client.get("/users/alice").json()["post_count"] == 2
+
+
+# ── DELETE response hygiene ──────────────────────────────────────────
+
+def test_adversarial_delete_response_has_no_body_content(client, alice):
+    # 204 = No Content.  The body must be exactly zero bytes, and
+    # Content-Length (if present) must be 0.  A FastAPI handler that
+    # returns None without an explicit Response() would emit the
+    # four-byte string "null".
+    pid = client.post("/posts", json={"message": "x"},
+                      headers={"X-Username": "alice"}).json()["id"]
+    r = client.delete(f"/posts/{pid}")
+    assert r.content == b""
+    cl = r.headers.get("content-length")
+    assert cl in (None, "0"), f"unexpected Content-Length: {cl}"
+
+
+# ── Fresh-user post_count sanity ─────────────────────────────────────
+
+def test_adversarial_freshly_created_user_has_zero_post_count(client):
+    # The POST /users response is HAND-BUILT (we don't re-SELECT
+    # through _USER_SELECT for performance).  This test confirms the
+    # hand-built dict agrees with what a re-read through GET /users
+    # would return — catches drift between the two code paths.
+    created = client.post("/users", json={"username": "alice"}).json()
+    fetched = client.get("/users/alice").json()
+    assert created == fetched
+    assert created["post_count"] == 0
+    assert created["bio"] is None
